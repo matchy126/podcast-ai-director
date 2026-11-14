@@ -26,94 +26,21 @@ $("drop").ondragover = e => e.preventDefault();
 $("drop").ondrop = e => { e.preventDefault(); setAudio(e.dataTransfer.files[0]); };
 $("bgm").onchange = e => { bgm = e.target.files[0] || null; $("bgmName").textContent = bgm ? `選択中：${bgm.name}` : "BGM未選択"; };
 
-function decodeAndResample(file, targetRate = 16000) {
-  return new Promise(async (resolve, reject) => {
-    let context;
-    try {
-      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-      if (!AudioContextClass) throw new Error("このブラウザは音声デコードに対応していません。");
-      context = new AudioContextClass();
-      const bytes = await file.arrayBuffer();
-      const decoded = await context.decodeAudioData(bytes);
-      const channels = Array.from({ length: decoded.numberOfChannels }, (_, i) => decoded.getChannelData(i));
-      const mono = new Float32Array(decoded.length);
-      for (let i = 0; i < decoded.length; i++) {
-        let sum = 0;
-        for (const channel of channels) sum += channel[i] || 0;
-        mono[i] = sum / channels.length;
-      }
-      if (decoded.sampleRate === targetRate) {
-        resolve(mono);
-      } else {
-        const ratio = decoded.sampleRate / targetRate;
-        const out = new Float32Array(Math.ceil(mono.length / ratio));
-        for (let i = 0; i < out.length; i++) {
-          const pos = i * ratio;
-          const left = Math.floor(pos);
-          const right = Math.min(left + 1, mono.length - 1);
-          const frac = pos - left;
-          out[i] = mono[left] * (1 - frac) + mono[right] * frac;
-        }
-        resolve(out);
-      }
-    } catch (error) {
-      reject(error);
-    } finally {
-      if (context && context.state !== "closed") context.close().catch(() => {});
-    }
-  });
-}
-
 async function transcribe() {
-  progress(3, "音声ファイルを読み込み中…", "音声のデコードと16kHzへの変換を行います。");
-  const pcm = await decodeAndResample(source, 16000);
-  progress(5, "文字起こしモデルを準備中…", `音声 ${(pcm.length / 16000 / 60).toFixed(1)} 分 · ${(pcm.length * 4 / 1048576).toFixed(0)} MB 相当のPCMデータ`);
-
-  return new Promise((resolve, reject) => {
-    const worker = new Worker(new URL("./transcribe-worker.js", import.meta.url), { type: "module" });
-    let settled = false;
-    const finish = (error, result) => {
-      if (settled) return;
-      settled = true;
-      worker.terminate();
-      if (error) reject(error); else resolve(result);
-    };
-    worker.onmessage = event => {
-      const msg = event.data || {};
-      if (msg.type === "model-progress") {
-        const pct = msg.percent == null ? 0 : Math.round(msg.percent);
-        progress(5 + Math.round(pct * .45), "AIモデルをダウンロード中…", msg.detail || "モデルファイルを取得中");
-      } else if (msg.type === "status") {
-        progress(52, msg.text || "モデルを初期化中…", "初回はモデルの読み込みに時間がかかります。");
-      } else if (msg.type === "started") {
-        progress(62, `音声を解析中…（0/${msg.totalChunks} 区間）`, `約25秒ずつ ${msg.totalChunks} 区間に分けて処理します。`);
-      } else if (msg.type === "chunk-progress") {
-        const ratio = msg.completed / msg.total;
-        progress(62 + Math.round(ratio * 36), `音声を解析中…（${msg.completed}/${msg.total} 区間）`, `${Math.round(ratio * 100)}% 完了`);
-      } else if (msg.type === "result") {
-        finish(null, msg.segments || []);
-      } else if (msg.type === "error") {
-        finish(new Error(msg.message || "文字起こしに失敗しました。"));
-      }
-    };
-    worker.onerror = event => finish(new Error(event.message || "文字起こしWorkerでエラーが発生しました。"));
-    worker.postMessage({ type: "transcribe", model: $("model").value, language: $("language").value, audio: pcm.buffer }, [pcm.buffer]);
-  });
+  const models = { tiny: "onnx-community/whisper-tiny", base: "onnx-community/whisper-base", small: "onnx-community/whisper-small" };
+  env.allowLocalModels = false;
+  const asr = await pipeline("automatic-speech-recognition", models[$("model").value], { dtype: "q8", progress_callback: p => { if (p.status === "progress") progress(5 + Math.round((p.progress || 0) * .45), "AIモデルをダウンロード中…", p.file || ""); } });
+  const url = URL.createObjectURL(source);
+  try {
+    const r = await asr(url, { language: $("language").value, task: "transcribe", chunk_length_s: 25, stride_length_s: 5, return_timestamps: true });
+    return (r.chunks || [{ timestamp: [0, null], text: r.text }]).map(c => ({ start: Number(c.timestamp?.[0] || 0), end: Number(c.timestamp?.[1] || 0), text: (c.text || "").trim() })).filter(x => x.text);
+  } finally { URL.revokeObjectURL(url); }
 }
 $("transcribe").onclick = async () => {
   $("transcribe").disabled = true;
-  try {
-    progress(2, "文字起こしを準備中…");
-    segments = await transcribe();
-    $("transcript").value = segments.map(s => `[${fmt(s.start)} - ${fmt(s.end)}] ${s.text}`).join("\n");
-    $("transcriptCard").hidden = false;
-    progress(100, "文字起こし完了", `${segments.length} 件の発話区間を取得しました。`);
-    $("transcriptCard").scrollIntoView({ behavior: "smooth" });
-  } catch (e) {
-    progress(0, "文字起こしに失敗しました", e.message || String(e));
-  } finally {
-    $("transcribe").disabled = false;
-  }
+  try { progress(2, "文字起こしを準備中…"); segments = await transcribe(); $("transcript").value = segments.map(s => `[${fmt(s.start)} - ${fmt(s.end)}] ${s.text}`).join("\n"); $("transcriptCard").hidden = false; $("transcriptCard").scrollIntoView({ behavior: "smooth" }); }
+  catch (e) { alert("文字起こしに失敗しました: " + e.message); progress(0, "エラー", e.message); }
+  finally { $("transcribe").disabled = false; }
 };
 function transcriptObject() { return { version: 1, language: $("language").value, source_file: source?.name, segments }; }
 function promptText() {
@@ -184,12 +111,50 @@ function renderTimeline() {
   });
   $("timelineScale").textContent = `00:00　　　　　　　　　　　　　　　　　${fmt(duration / 2)}　　　　　　　　　　　　　　　　　${fmt(duration)}`;
 }
+let ffLoadPromise = null;
 async function loadFF() {
-  if (ff) return ff;
-  ff = new FFmpeg(); ff.on("progress", ({ progress }) => editProgress(45 + Math.round(progress * 45), "音声をレンダリング中…"));
-  const base = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd";
-  await ff.load({ coreURL: await toBlobURL(base + "/ffmpeg-core.js", "text/javascript"), wasmURL: await toBlobURL(base + "/ffmpeg-core.wasm", "application/wasm") });
-  return ff;
+  // Reuse only a fully initialized instance. A failed load must never leave a
+  // truthy FFmpeg object behind, otherwise later calls skip load() and fail
+  // with "ffmpeg is not loaded".
+  if (ff && ff.loaded) return ff;
+  if (ffLoadPromise) return ffLoadPromise;
+
+  ffLoadPromise = (async () => {
+    const candidate = new FFmpeg();
+    candidate.on("progress", ({ progress }) => {
+      editProgress(45 + Math.round((progress || 0) * 45), "音声をレンダリング中…");
+    });
+    candidate.on("log", ({ message }) => {
+      // Keep FFmpeg logs out of blocking alert dialogs; surface useful details
+      // only when loading/execution fails.
+      candidate.lastLog = message;
+    });
+
+    const base = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd";
+    try {
+      editProgress(8, "FFmpeg本体をダウンロード中…");
+      const [coreURL, wasmURL] = await Promise.all([
+        toBlobURL(base + "/ffmpeg-core.js", "text/javascript"),
+        toBlobURL(base + "/ffmpeg-core.wasm", "application/wasm")
+      ]);
+      editProgress(25, "FFmpegを初期化中…");
+      await candidate.load({ coreURL, wasmURL });
+      if (!candidate.loaded) throw new Error("FFmpegの初期化完了を確認できませんでした。");
+      ff = candidate;
+      return candidate;
+    } catch (error) {
+      try { candidate.terminate(); } catch {}
+      ff = null;
+      const detail = error?.message || String(error);
+      throw new Error("FFmpegの読み込みに失敗しました。ページを再読み込みして再試行してください。詳細: " + detail);
+    }
+  })();
+
+  try {
+    return await ffLoadPromise;
+  } finally {
+    ffLoadPromise = null;
+  }
 }
 function mapOriginalTime(time, keep) {
   let offset = 0;
@@ -260,6 +225,16 @@ $("execute").onclick = async () => {
     $("preview").src = outputUrl; $("save").href = outputUrl; $("save").download = "podcast_final." + $("format").value;
     $("output").hidden = false; $("editedDuration").textContent = `完成音源 · ${(blob.size / 1048576).toFixed(1)} MB`;
     $("compareCard").hidden = false; editProgress(100, "編集完了"); $("output").scrollIntoView({ behavior: "smooth", block: "nearest" });
-  } catch (e) { alert("編集できませんでした: " + e.message); editProgress(0, "エラー"); }
+  } catch (e) {
+    editProgress(0, "編集できませんでした: " + (e?.message || String(e)));
+    let errorBox = $("editError");
+    if (!errorBox) {
+      errorBox = document.createElement("pre");
+      errorBox.id = "editError";
+      errorBox.className = "validation err";
+      $("editProgressBox").after(errorBox);
+    }
+    errorBox.textContent = e?.stack || e?.message || String(e);
+  }
   finally { $("execute").disabled = false; }
 };

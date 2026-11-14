@@ -1,16 +1,13 @@
-Podcast AI Director - transcription fix v0.8
+Podcast AI Director - FFmpeg load fix
 
-Replace the existing index.html and app.js in your GitHub Pages repository with these files, and add transcribe-worker.js in the same directory.
-Keep your existing style.css file in place.
+Replace the app.js in your GitHub Pages repository with this file.
+Keep index.html and style.css unchanged.
 
-What changed:
-- Audio decoding/resampling is done before transcription.
-- Whisper runs in a Web Worker so inference does not occupy the page's main thread.
-- Audio is processed in sequential 25-second segments.
-- Progress advances for each completed segment rather than remaining fixed at 62%.
-- Transcription errors are shown in the existing progress area (no alert popup).
+Fixes:
+- FFmpeg instance is cached only after a successful load.
+- A failed FFmpeg load clears the instance so retry does not skip ff.load().
+- Concurrent load requests share one initialization promise.
+- FFmpeg loading and initialization stages are displayed.
+- Editing errors are shown in a selectable page area rather than only in a popup.
 
-Notes:
-- The first run still needs to download the selected Whisper model.
-- This has passed JavaScript syntax checks, but actual inference must be tested in the target browser/device.
-- For low-memory devices, choose Tiny first. Base and Small require more memory and processing time.
+After committing, hard-refresh the deployed page (Ctrl+Shift+R). If the browser still serves an old module, clear the site's cached data or change the app.js URL/version query in index.html.
