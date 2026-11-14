@@ -1,3 +1,4 @@
+import { pipeline, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.2";
 import { FFmpeg } from "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/index.js";
 import { fetchFile, toBlobURL } from "https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/dist/esm/index.js";
 
@@ -25,102 +26,95 @@ $("drop").ondragover = e => e.preventDefault();
 $("drop").ondrop = e => { e.preventDefault(); setAudio(e.dataTransfer.files[0]); };
 $("bgm").onchange = e => { bgm = e.target.files[0] || null; $("bgmName").textContent = bgm ? `選択中：${bgm.name}` : "BGM未選択"; };
 
-let transcriptionWorker = null;
-let workerBusy = false;
-
-function getTranscriptionWorker() {
-  if (transcriptionWorker) return transcriptionWorker;
-  transcriptionWorker = new Worker(new URL("./transcribe-worker.js", import.meta.url), { type: "module" });
-  transcriptionWorker.onmessage = event => {
-    const msg = event.data || {};
-    if (msg.type === "progress") {
-      const pct = Number.isFinite(msg.percent) ? Math.round(3 + msg.percent * 0.45) : 8;
-      progress(Math.min(48, pct), msg.label || "AIモデルをダウンロード中…", msg.detail || "");
-    } else if (msg.type === "status") {
-      const stages = {
-        initializing: [52, "モデルを初期化中…"],
-        transcribing: [62, "音声を解析中…"]
-      };
-      const stage = stages[msg.stage] || [50, "処理中…"];
-      progress(stage[0], stage[1], msg.detail || "処理には時間がかかる場合があります。");
-    } else if (msg.type === "result") {
-      segments = msg.segments || [];
-      $("transcript").value = segments.map(s => `[${fmt(s.start)} - ${fmt(s.end)}] ${s.text}`).join("\n");
-      $("transcriptCard").hidden = false;
-      $("transcriptCard").scrollIntoView({ behavior: "smooth" });
-      progress(100, "文字起こし完了", `${segments.length}個の発話区間`);
-      finishTranscription();
-    } else if (msg.type === "error") {
-      progress(0, "文字起こしに失敗しました", msg.message || "不明なエラー");
-      finishTranscription();
+function decodeAndResample(file, targetRate = 16000) {
+  return new Promise(async (resolve, reject) => {
+    let context;
+    try {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) throw new Error("このブラウザは音声デコードに対応していません。");
+      context = new AudioContextClass();
+      const bytes = await file.arrayBuffer();
+      const decoded = await context.decodeAudioData(bytes);
+      const channels = Array.from({ length: decoded.numberOfChannels }, (_, i) => decoded.getChannelData(i));
+      const mono = new Float32Array(decoded.length);
+      for (let i = 0; i < decoded.length; i++) {
+        let sum = 0;
+        for (const channel of channels) sum += channel[i] || 0;
+        mono[i] = sum / channels.length;
+      }
+      if (decoded.sampleRate === targetRate) {
+        resolve(mono);
+      } else {
+        const ratio = decoded.sampleRate / targetRate;
+        const out = new Float32Array(Math.ceil(mono.length / ratio));
+        for (let i = 0; i < out.length; i++) {
+          const pos = i * ratio;
+          const left = Math.floor(pos);
+          const right = Math.min(left + 1, mono.length - 1);
+          const frac = pos - left;
+          out[i] = mono[left] * (1 - frac) + mono[right] * frac;
+        }
+        resolve(out);
+      }
+    } catch (error) {
+      reject(error);
+    } finally {
+      if (context && context.state !== "closed") context.close().catch(() => {});
     }
-  };
-  transcriptionWorker.onerror = event => {
-    progress(0, "文字起こしワーカーでエラー", event.message || "Worker error");
-    finishTranscription();
-    transcriptionWorker?.terminate();
-    transcriptionWorker = null;
-  };
-  return transcriptionWorker;
-}
-
-function finishTranscription() {
-  workerBusy = false;
-  $("transcribe").disabled = false;
-}
-
-async function decodeAndResample(file, targetRate = 16000) {
-  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-  if (!AudioContextClass) throw new Error("このブラウザはAudioContextに対応していません。ChromeまたはEdgeを使用してください。");
-  const context = new AudioContextClass();
-  try {
-    const buffer = await context.decodeAudioData(await file.arrayBuffer());
-    const channels = [];
-    for (let c = 0; c < buffer.numberOfChannels; c++) channels.push(buffer.getChannelData(c));
-    const mono = new Float32Array(buffer.length);
-    for (let i = 0; i < buffer.length; i++) {
-      let sum = 0;
-      for (let c = 0; c < channels.length; c++) sum += channels[c][i];
-      mono[i] = sum / channels.length;
-    }
-    if (buffer.sampleRate === targetRate) return mono;
-    const outputLength = Math.ceil(mono.length * targetRate / buffer.sampleRate);
-    const output = new Float32Array(outputLength);
-    const ratio = buffer.sampleRate / targetRate;
-    for (let i = 0; i < outputLength; i++) {
-      const position = i * ratio;
-      const left = Math.floor(position);
-      const right = Math.min(left + 1, mono.length - 1);
-      const fraction = position - left;
-      output[i] = mono[left] * (1 - fraction) + mono[right] * fraction;
-    }
-    return output;
-  } finally {
-    await context.close();
-  }
+  });
 }
 
 async function transcribe() {
-  if (!source || workerBusy) return;
-  workerBusy = true;
+  progress(3, "音声ファイルを読み込み中…", "音声のデコードと16kHzへの変換を行います。");
+  const pcm = await decodeAndResample(source, 16000);
+  progress(5, "文字起こしモデルを準備中…", `音声 ${(pcm.length / 16000 / 60).toFixed(1)} 分 · ${(pcm.length * 4 / 1048576).toFixed(0)} MB 相当のPCMデータ`);
+
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL("./transcribe-worker.js", import.meta.url), { type: "module" });
+    let settled = false;
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      worker.terminate();
+      if (error) reject(error); else resolve(result);
+    };
+    worker.onmessage = event => {
+      const msg = event.data || {};
+      if (msg.type === "model-progress") {
+        const pct = msg.percent == null ? 0 : Math.round(msg.percent);
+        progress(5 + Math.round(pct * .45), "AIモデルをダウンロード中…", msg.detail || "モデルファイルを取得中");
+      } else if (msg.type === "status") {
+        progress(52, msg.text || "モデルを初期化中…", "初回はモデルの読み込みに時間がかかります。");
+      } else if (msg.type === "started") {
+        progress(62, `音声を解析中…（0/${msg.totalChunks} 区間）`, `約25秒ずつ ${msg.totalChunks} 区間に分けて処理します。`);
+      } else if (msg.type === "chunk-progress") {
+        const ratio = msg.completed / msg.total;
+        progress(62 + Math.round(ratio * 36), `音声を解析中…（${msg.completed}/${msg.total} 区間）`, `${Math.round(ratio * 100)}% 完了`);
+      } else if (msg.type === "result") {
+        finish(null, msg.segments || []);
+      } else if (msg.type === "error") {
+        finish(new Error(msg.message || "文字起こしに失敗しました。"));
+      }
+    };
+    worker.onerror = event => finish(new Error(event.message || "文字起こしWorkerでエラーが発生しました。"));
+    worker.postMessage({ type: "transcribe", model: $("model").value, language: $("language").value, audio: pcm.buffer }, [pcm.buffer]);
+  });
+}
+$("transcribe").onclick = async () => {
   $("transcribe").disabled = true;
   try {
-    progress(2, "音声を読み込み中…", "ブラウザで音声をPCMデータに変換しています。");
-    const pcm = await decodeAndResample(source, 16000);
-    progress(3, "AIモデルを準備中…", "音声をWorkerへ渡しています。");
-    getTranscriptionWorker().postMessage({
-      type: "transcribe",
-      audio: pcm.buffer,
-      model: $("model").value,
-      language: $("language").value
-    }, [pcm.buffer]);
-  } catch (error) {
-    progress(0, "音声の読み込みに失敗しました", error?.stack || error?.message || String(error));
-    finishTranscription();
+    progress(2, "文字起こしを準備中…");
+    segments = await transcribe();
+    $("transcript").value = segments.map(s => `[${fmt(s.start)} - ${fmt(s.end)}] ${s.text}`).join("\n");
+    $("transcriptCard").hidden = false;
+    progress(100, "文字起こし完了", `${segments.length} 件の発話区間を取得しました。`);
+    $("transcriptCard").scrollIntoView({ behavior: "smooth" });
+  } catch (e) {
+    progress(0, "文字起こしに失敗しました", e.message || String(e));
+  } finally {
+    $("transcribe").disabled = false;
   }
-}
-$("transcribe").onclick = () => transcribe();
-
+};
 function transcriptObject() { return { version: 1, language: $("language").value, source_file: source?.name, segments }; }
 function promptText() {
   return `あなたはポッドキャストの編集ディレクターです。以下のタイムスタンプ付き文字起こしを読み、編集指示JSONを作成してください。\n\n方針:\n- 会話の意味を損なわない。発言の途中を切らない。\n- 不要な長い沈黙、明確な言い直し、重複だけを慎重に候補化する。\n- 話題転換には必要に応じてジングルを置く。\n- BGMは会話を邪魔しない音量にする。\n- 不確かな編集は実行せず、notesに理由を書く。\n\n出力は説明文やMarkdown囲みなしのJSONのみ。形式:\n{"version":1,"operations":[{"type":"cut","start":12.5,"end":18.2,"reason":"理由"},{"type":"bgm","start":0,"end":60,"track":"main","volume":0.12,"fade_in":2,"fade_out":3},{"type":"fade","start":58,"end":60,"effect":"out"},{"type":"marker","time":120,"label":"話題転換"}],"notes":["確認事項"]}\n\n利用可能な操作:\n- cut: start/end秒。音源から区間を削除\n- bgm: start/end秒、trackは"main"、volumeは0〜1、fade_in/fade_outは任意の秒数。BGMは指定区間だけ再生し、カットされた区間では元音源時間に沿って進める\n- fade: start/end秒、effectは"in"または"out"。指定範囲で音量をフェード\n- marker: time秒、label文字列（編集目印のみ）\n\n時刻はすべて元音源上の秒数です。音源の長さを超えないでください。カット区間を重複させないでください。\n\n文字起こし:\n${$("transcript").value}`;

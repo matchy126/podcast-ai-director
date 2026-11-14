@@ -12,7 +12,7 @@
 <nav class="steps"><span class="active">01 文字起こし</span><span>02 AIに依頼</span><span>03 編集・書き出し</span></nav>
 <section class="card">
 <div class="heading"><div><small>STEP 01</small><h2>収録音源を読み込む</h2></div><span class="tag">MP3 / WAV / M4A など</span></div>
-<label class="drop" id="drop"><input id="audio" type="file" accept="audio/*"><b>＋</b><strong id="audioName">音声ファイルを選択、またはドロップ</strong><small>ファイルは外部サーバーにアップロードされません</small><small>文字起こしは別スレッドで実行し、画面のフリーズを抑えます</small><small id="sourceDuration"></small></label>
+<label class="drop" id="drop"><input id="audio" type="file" accept="audio/*"><b>＋</b><strong id="audioName">音声ファイルを選択、またはドロップ</strong><small>ファイルは外部サーバーにアップロードされません</small><small id="sourceDuration"></small></label>
 <div class="row controls"><label>文字起こしモデル<select id="model"><option value="tiny">Tiny・軽量</option><option value="base" selected>Base・おすすめ</option><option value="small">Small・高精度 / 重い</option></select></label><label>言語<select id="language"><option value="japanese" selected>日本語</option><option value="english">英語</option></select></label></div>
 <button class="primary" id="transcribe" disabled>タイムスタンプ付き文字起こしを作成</button>
 <div class="progressbox" id="progressbox" hidden><div><span id="progressText">準備中</span><b id="progressNum">0%</b></div><progress id="progress" max="100" value="0"></progress><small id="progressDetail"></small></div>
@@ -37,8 +37,8 @@
 <div class="progressbox" id="editProgressBox" hidden><div><span id="editProgressText">編集中</span><b id="editProgressNum">0%</b></div><progress id="editProgress" max="100" value="0"></progress></div>
 <div id="output" hidden><a id="save" class="primary download" download>完成音源を保存 ↓</a></div>
 </section>
-<section class="card safety"><b>安全と注意</b><p>編集指示はJSONとして読み込み、許可された操作だけを実行します。任意のJavaScriptやコードは実行しません。AIの指示を適用する前に、カット位置・BGM位置・音量を必ず確認してください。初回はAIモデルとFFmpegのダウンロードが必要です。文字起こしはWeb Workerで実行しますが、端末のメモリ不足やブラウザの制限による失敗を完全には防げません。</p></section>
-<footer>Podcast AI Director · GitHub Pages edition · v0.6 · Worker transcription</footer>
+<section class="card safety"><b>安全と注意</b><p>編集指示はJSONとして読み込み、許可された操作だけを実行します。任意のJavaScriptやコードは実行しません。AIの指示を適用する前に、カット位置・BGM位置・音量を必ず確認してください。初回はAIモデルとFFmpegのダウンロードが必要です。</p></section>
+<footer>Podcast AI Director · GitHub Pages edition · v0.5</footer>
 </main>
 <script type="module" src="./app.js"></script>
 </body></html>
