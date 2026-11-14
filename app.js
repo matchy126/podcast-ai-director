@@ -1,4 +1,3 @@
-import { pipeline, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.2";
 import { FFmpeg } from "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/index.js";
 import { fetchFile, toBlobURL } from "https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/dist/esm/index.js";
 
@@ -26,22 +25,51 @@ $("drop").ondragover = e => e.preventDefault();
 $("drop").ondrop = e => { e.preventDefault(); setAudio(e.dataTransfer.files[0]); };
 $("bgm").onchange = e => { bgm = e.target.files[0] || null; $("bgmName").textContent = bgm ? `選択中：${bgm.name}` : "BGM未選択"; };
 
-async function transcribe() {
-  const models = { tiny: "onnx-community/whisper-tiny", base: "onnx-community/whisper-base", small: "onnx-community/whisper-small" };
-  env.allowLocalModels = false;
-  const asr = await pipeline("automatic-speech-recognition", models[$("model").value], { dtype: "q8", progress_callback: p => { if (p.status === "progress") progress(5 + Math.round((p.progress || 0) * .45), "AIモデルをダウンロード中…", p.file || ""); } });
-  const url = URL.createObjectURL(source);
-  try {
-    const r = await asr(url, { language: $("language").value, task: "transcribe", chunk_length_s: 25, stride_length_s: 5, return_timestamps: true });
-    return (r.chunks || [{ timestamp: [0, null], text: r.text }]).map(c => ({ start: Number(c.timestamp?.[0] || 0), end: Number(c.timestamp?.[1] || 0), text: (c.text || "").trim() })).filter(x => x.text);
-  } finally { URL.revokeObjectURL(url); }
+let transcriptionWorker = null;
+let workerBusy = false;
+function finishWorkerTask() { workerBusy = false; $("transcribe").disabled = false; }
+function getTranscriptionWorker() {
+  if (transcriptionWorker) return transcriptionWorker;
+  transcriptionWorker = new Worker(new URL("./transcribe-worker.js", import.meta.url), { type: "module" });
+  transcriptionWorker.onmessage = ({ data: msg }) => {
+    if (msg.type === "progress") {
+      const pct = Number.isFinite(msg.percent) ? Math.round(Math.max(3, Math.min(48, msg.percent * 0.48))) : 12;
+      progress(pct, msg.label || "AIモデルをダウンロード中…", msg.detail || "");
+    } else if (msg.type === "status") {
+      const states = {
+        initializing: [52, "モデルを初期化中…"],
+        transcribing: [62, "音声を解析中…"]
+      };
+      const state = states[msg.stage] || [50, msg.label || "処理中…"];
+      progress(state[0], state[1], msg.detail || "処理には数分かかる場合があります。");
+    } else if (msg.type === "result") {
+      segments = msg.segments || [];
+      $("transcript").value = segments.map(s => `[${fmt(s.start)} - ${fmt(s.end)}] ${s.text}`).join("\n");
+      $("transcriptCard").hidden = false;
+      $("transcriptCard").scrollIntoView({ behavior: "smooth" });
+      progress(100, "文字起こし完了", `${segments.length}個の発話区間`);
+      finishWorkerTask();
+    } else if (msg.type === "error") {
+      progress(0, "文字起こしに失敗しました", msg.message || "不明なエラー");
+      alert("文字起こしに失敗しました:\n" + (msg.message || "不明なエラー"));
+      finishWorkerTask();
+    }
+  };
+  transcriptionWorker.onerror = (event) => {
+    progress(0, "文字起こしワーカーでエラー", event.message || "Worker error");
+    alert("文字起こし処理でエラーが発生しました。ページを再読み込みして再試行してください。");
+    finishWorkerTask(); transcriptionWorker?.terminate(); transcriptionWorker = null;
+  };
+  return transcriptionWorker;
 }
-$("transcribe").onclick = async () => {
-  $("transcribe").disabled = true;
-  try { progress(2, "文字起こしを準備中…"); segments = await transcribe(); $("transcript").value = segments.map(s => `[${fmt(s.start)} - ${fmt(s.end)}] ${s.text}`).join("\n"); $("transcriptCard").hidden = false; $("transcriptCard").scrollIntoView({ behavior: "smooth" }); }
-  catch (e) { alert("文字起こしに失敗しました: " + e.message); progress(0, "エラー", e.message); }
-  finally { $("transcribe").disabled = false; }
-};
+function transcribe() {
+  if (!source || workerBusy) return;
+  workerBusy = true; $("transcribe").disabled = true;
+  progress(2, "文字起こしを準備中…", "画面とは別のスレッドで処理します。");
+  getTranscriptionWorker().postMessage({ type: "transcribe", file: source, model: $("model").value, language: $("language").value });
+}
+$("transcribe").onclick = () => transcribe();
+
 function transcriptObject() { return { version: 1, language: $("language").value, source_file: source?.name, segments }; }
 function promptText() {
   return `あなたはポッドキャストの編集ディレクターです。以下のタイムスタンプ付き文字起こしを読み、編集指示JSONを作成してください。\n\n方針:\n- 会話の意味を損なわない。発言の途中を切らない。\n- 不要な長い沈黙、明確な言い直し、重複だけを慎重に候補化する。\n- 話題転換には必要に応じてジングルを置く。\n- BGMは会話を邪魔しない音量にする。\n- 不確かな編集は実行せず、notesに理由を書く。\n\n出力は説明文やMarkdown囲みなしのJSONのみ。形式:\n{"version":1,"operations":[{"type":"cut","start":12.5,"end":18.2,"reason":"理由"},{"type":"bgm","start":0,"end":60,"track":"main","volume":0.12,"fade_in":2,"fade_out":3},{"type":"fade","start":58,"end":60,"effect":"out"},{"type":"marker","time":120,"label":"話題転換"}],"notes":["確認事項"]}\n\n利用可能な操作:\n- cut: start/end秒。音源から区間を削除\n- bgm: start/end秒、trackは"main"、volumeは0〜1、fade_in/fade_outは任意の秒数。BGMは指定区間だけ再生し、カットされた区間では元音源時間に沿って進める\n- fade: start/end秒、effectは"in"または"out"。指定範囲で音量をフェード\n- marker: time秒、label文字列（編集目印のみ）\n\n時刻はすべて元音源上の秒数です。音源の長さを超えないでください。カット区間を重複させないでください。\n\n文字起こし:\n${$("transcript").value}`;
