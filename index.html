@@ -15,40 +15,18 @@
 <div id="drop" class="dropzone">
 <input type="file" id="audio" accept="audio/*,.aac,.m4a,.mp3,.wav,.ogg,.flac,.wma">
 <p>音源ファイルをドラッグ＆ドロップ、またはクリックして選択</p>
-<p class="small">応形式：MP3 / WAV / M4A / AAC / OGG / FLAC など</p>
+<p class="small">対応形式：MP3 / WAV / M4A / AAC / OGG / FLAC など</p>
 </div>
 <div id="audioName" class="filename"></div>
 <div id="sourceDuration" class="duration"></div>
 <audio id="originalPreview" controls hidden></audio>
 </div>
 
-<!-- 波形ビューワー -->
-<div class="card" id="waveformCard" hidden>
-<h2>波形分析</h2>
-<div id="waveformWrap" class="waveform-wrap">
-<canvas id="waveform"></canvas>
-<div id="waveformCursor" class="waveform-cursor"></div>
-<div id="waveformOverlay" class="waveform-overlay"></div>
-</div>
-<div class="waveform-toolbar">
-<button id="waveformZoomOut">縮小</button>
-<button id="waveformZoomIn">拡大</button>
-<button id="waveformReset">全体表示</button>
-<span id="waveformInfo" class="small"></span>
-</div>
-<div class="waveform-legend">
-<span class="legend-item"><span class="legend-color silence"></span>沈黙候補</span>
-<span class="legend-item"><span class="legend-color speakerA"></span>話者A候補</span>
-<span class="legend-item"><span class="legend-color speakerB"></span>話者B候補</span>
-<span class="legend-item"><span class="legend-color cut"></span>カット候補</span>
-</div>
-</div>
-
 <div class="card" id="transcribeCard">
 <h2>文字起こし</h2>
 <div class="row">
 <label>モデル：<select id="model"><option value="tiny">Tiny（速い）</option><option value="base" selected>Base（標準）</option><option value="small">Small（高精度）</option></select></label>
-<label>言：<select id="language"><option value="ja">日本語</option><option value="en">英語</option><option value="auto">自動検出</option></select></label>
+<label>言語：<select id="language"><option value="ja">日本語</option><option value="en">英語</option><option value="auto">自動検出</option></select></label>
 </div>
 <button id="transcribe" disabled>文字起こし開始</button>
 <div id="progressbox" hidden>
@@ -63,8 +41,7 @@
 <h2>文字起こし結果</h2>
 <div class="speaker-tools">
 <button id="autoSpeaker" class="small-btn">話者を自動推定（間隔ベース）</button>
-<button id="analyzeWaveform" class="small-btn">波形から沈黙・話者を推定</button>
-<span class="small">音量変化と間隔から話者切り替わりを推定します</span>
+<span class="small">セグメント間が1.5秒以上空くと話者を切り替えます</span>
 </div>
 <div id="transcriptContainer" class="transcript-container"></div>
 <textarea id="transcript" rows="10" placeholder="文字起こし結果がここに表示されます"></textarea>
@@ -108,7 +85,7 @@
 <h2>完成音源</h2>
 <audio id="preview" controls></audio>
 <div id="editedDuration"></div>
-<a id="save" class="btn" download>ダンロード</a>
+<a id="save" class="btn" download>ダウンロード</a>
 </div>
 
 <div id="output" hidden></div>
