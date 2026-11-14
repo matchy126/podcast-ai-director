@@ -19,6 +19,7 @@ function setAudio(f) {
   const audio = new Audio(sourceUrl);
   audio.onloadedmetadata = () => { sourceDuration = audio.duration; $("sourceDuration").textContent = `音源の長さ：${fmt(sourceDuration)}`; };
   $("originalPreview").src = sourceUrl;
+  $("originalPreview").hidden = false;
   $("compareCard").hidden = false;
   $("output").hidden = true;
 }
@@ -26,9 +27,8 @@ $("drop").ondragover = e => e.preventDefault();
 $("drop").ondrop = e => { e.preventDefault(); setAudio(e.dataTransfer.files[0]); };
 $("bgm").onchange = e => { bgm = e.target.files[0] || null; $("bgmName").textContent = bgm ? `選択中：${bgm.name}` : "BGM未選択"; };
 
-/* === 音声前処理：繰り返し対策 === */
 async function preprocessAudio(file) {
-  progress(3, "音声をクリーンアップ中…", "サンプリングレート統一・ノイズ除去");
+  progress(3, "音声を準備中…", "16kHz・モノラル変換");
   const ctx = new AudioContext({ sampleRate: 16000 });
   try {
     const buf = await file.arrayBuffer();
@@ -36,65 +36,54 @@ async function preprocessAudio(file) {
     const len = decoded.length;
     const ch = decoded.numberOfChannels;
     const mono = new Float32Array(len);
-    for (let i = 0; i < len; i++) { let s = 0; for (let c = 0; c < ch; c++) s += decoded.getChannelData(c)[i]; mono[i] = s / ch; }
-    // ハイパスフィルタ（200Hz以下カット）でノイズ・ハウリング除去
-    const filtered = new Float32Array(len);
-    const RC = 1.0 / (2 * Math.PI * 200);
-    const dt = 1.0 / 16000;
-    const alpha = RC / (RC + dt);
-    filtered[0] = mono[0];
-    for (let i = 1; i < len; i++) filtered[i] = alpha * (filtered[i - 1] + mono[i] - mono[i - 1]);
-    // ピークノーマライズ
-    let peak = 0; for (let i = 0; i < len; i++) { const a = Math.abs(filtered[i]); if (a > peak) peak = a; }
-    if (peak > 0) for (let i = 0; i < len; i++) filtered[i] /= peak;
-    // WAV にエンコードして Blob 化
-    const wavBuf = encodeWav(filtered, 16000);
-    return new Blob([wavBuf], { type: "audio/wav" });
+    if (ch === 1) {
+      mono.set(decoded.getChannelData(0));
+    } else {
+      for (let i = 0; i < len; i++) { let s = 0; for (let c = 0; c < ch; c++) s += decoded.getChannelData(c)[i]; mono[i] = s / ch; }
+    }
+    let peak = 0;
+    for (let i = 0; i < len; i++) { const a = Math.abs(mono[i]); if (a > peak) peak = a; }
+    if (peak > 0 && peak !== 1) {
+      const inv = 1 / peak;
+      for (let i = 0; i < len; i++) mono[i] *= inv;
+    }
+    return new Blob([encodeWavFast(mono, 16000)], { type: "audio/wav" });
   } finally { ctx.close(); }
 }
-function encodeWav(samples, sampleRate) {
-  const buffer = new ArrayBuffer(44 + samples.length * 2);
-  const view = new DataView(buffer);
-  const writeString = (offset, string) => { for (let i = 0; i < string.length; i++) view.setUint8(offset + i, string.charCodeAt(i)); };
-  writeString(0, "RIFF"); view.setUint32(4, 36 + samples.length * 2, true); writeString(8, "WAVE");
-  writeString(12, "fmt "); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
-  view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
-  writeString(36, "data"); view.setUint32(40, samples.length * 2, true);
-  let offset = 44;
-  for (let i = 0; i < samples.length; i++) { let s = Math.max(-1, Math.min(1, samples[i])); s = s < 0 ? s * 0x8000 : s * 0x7FFF; view.setInt16(offset, s, true); offset += 2; }
-  return buffer;
+function encodeWavFast(samples, sampleRate) {
+  const len = samples.length;
+  const buf = new ArrayBuffer(44 + len * 2);
+  const v = new DataView(buf);
+  v.setUint32(0, 0x52494646, false);
+  v.setUint32(4, 36 + len * 2, true);
+  v.setUint32(8, 0x57415645, false);
+  v.setUint32(12, 0x666d7420, false);
+  v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true);
+  v.setUint32(24, sampleRate, true);
+  v.setUint32(28, sampleRate * 2, true);
+  v.setUint16(32, 2, true);
+  v.setUint16(34, 16, true);
+  v.setUint32(36, 0x64617461, false);
+  v.setUint32(40, len * 2, true);
+  const arr = new Int16Array(buf, 44);
+  for (let i = 0; i < len; i++) {
+    const s = samples[i];
+    arr[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+  }
+  return buf;
 }
 
-/* === 文字起こし後処理：繰り返し除去 === */
 function cleanTranscript(text) {
   if (!text) return "";
   let s = text;
-  // 1文字の繰り返し（5, ガ, そ, う など）を 3回以上 → 1回
-  s = s.replace(/(\S)\1{10,}/g, "$1");
-  // 2〜4文字のパターン繰り返し（「ガンガン」「そうから」「ありがとうございます」など）
-  s = s.replace(/(\S{2,4})(?:\s*\1){5,}/g, "$1");
-  // 単語レベルの 3回以上繰り返し（空白込み）
-  s = s.replace(/\b(\S+)(?:\s+\1){3,}\b/g, "$1 $1");
-  // 句読点だけの繰り返しは残す
-  s = s.replace(/([。、\.\,])\1{10,}/g, "$1");
-  // 長い空白・改行を整理
-  s = s.replace(/\n{4,}/g, "\n\n");
+  s = s.replace(/(\S)\1{9,}/g, "$1");
+  s = s.replace(/(\S{2,4})(?:\s*\1){4,}/g, "$1");
+  s = s.replace(/\b(\S+)(?:\s+\1){2,}\b/g, "$1 $1");
+  s = s.replace(/([。、])\1{9,}/g, "$1");
+  s = s.replace(/\n{3,}/g, "\n\n");
   return s.trim();
-}
-
-async function transcribe() {
-  const models = { tiny: "onnx-community/whisper-tiny", base: "onnx-community/whisper-base", small: "onnx-community/whisper-small" };
-  env.allowLocalModels = false;
-  const asr = await pipeline("automatic-speech-recognition", models[$("model").value], { dtype: "q8", progress_callback: p => { if (p.status === "progress") progress(5 + Math.round((p.progress || 0) * .45), "AIモデルをダウンロード中…", p.file || ""); } });
-  const cleanBlob = await preprocessAudio(source);
-  const url = URL.createObjectURL(cleanBlob);
-  try {
-    const r = await asr(url, { language: $("language").value, task: "transcribe", chunk_length_s: 30, stride_length_s: 5, return_timestamps: true });
-    let chunks = (r.chunks || [{ timestamp: [0, null], text: r.text }]).map(c => ({ start: Number(c.timestamp?.[0] || 0), end: Number(c.timestamp?.[1] || 0), text: cleanTranscript((c.text || "").trim()) })).filter(x => x.text);
-    // チャンク間の重複テキストを除去
-    chunks = mergeOverlappingChunks(chunks);
-    return chunks;
-  } finally { URL.revokeObjectURL(url); }
 }
 
 function mergeOverlappingChunks(chunks) {
@@ -103,11 +92,17 @@ function mergeOverlappingChunks(chunks) {
   for (let i = 1; i < chunks.length; i++) {
     const prev = out[out.length - 1];
     const cur = chunks[i];
-    const overlap = findOverlap(prev.text, cur.text);
-    if (overlap.length > 3) {
-      prev.text = prev.text.slice(0, prev.text.lastIndexOf(overlap)) + overlap;
+    const a = prev.text, b = cur.text;
+    const max = Math.min(a.length, b.length);
+    let overlap = "";
+    for (let j = Math.min(max, 20); j > 3; j--) {
+      if (a.slice(-j) === b.slice(0, j)) { overlap = b.slice(0, j); break; }
+    }
+    if (overlap) {
+      const idx = a.lastIndexOf(overlap);
+      prev.text = (idx >= 0 ? a.slice(0, idx) : a) + overlap;
       prev.end = cur.end;
-      cur.text = cur.text.slice(overlap.length).trim();
+      cur.text = b.slice(overlap.length).trim();
       if (cur.text) out.push(cur);
     } else {
       out.push(cur);
@@ -115,24 +110,338 @@ function mergeOverlappingChunks(chunks) {
   }
   return out;
 }
-function findOverlap(a, b) {
-  const max = Math.min(a.length, b.length);
-  for (let i = max; i > 2; i--) {
-    if (a.slice(-i) === b.slice(0, i)) return b.slice(0, i);
-  }
-  return "";
+
+async function transcribe() {
+  const models = { tiny: "onnx-community/whisper-tiny", base: "onnx-community/whisper-base", small: "onnx-community/whisper-small" };
+  env.allowLocalModels = false;
+  env.useBrowserCache = true;
+  const asr = await pipeline("automatic-speech-recognition", models[$("model").value], { dtype: "q8", progress_callback: (() => { let last = 0; return p => { if (p.status === "progress") { const cur = Math.round((p.progress || 0)); if (cur - last >= 5) { last = cur; progress(5 + Math.round(cur * .45), `AIモデルを読み込み中… ${cur}%`, p.file || ""); } } }; })() });
+  const cleanBlob = await preprocessAudio(source);
+  const url = URL.createObjectURL(cleanBlob);
+  try {
+    const r = await asr(url, { language: $("language").value, task: "transcribe", chunk_length_s: 25, stride_length_s: 3, return_timestamps: true });
+    let chunks = (r.chunks || [{ timestamp: [0, null], text: r.text }]).map(c => ({ start: Number(c.timestamp?.[0] || 0), end: Number(c.timestamp?.[1] || 0), text: cleanTranscript((c.text || "").trim()), speaker: "unknown" })).filter(x => x.text);
+    chunks = mergeOverlappingChunks(chunks);
+    return chunks;
+  } finally { URL.revokeObjectURL(url); }
 }
 
-$("transcribe").onclick = async () => {
+
+/* === 波形分析 === */
+let audioBuffer = null;
+let waveformData = null;
+let silenceRegions = [];
+let speakerRegions = [];
+let waveformZoom = 1;
+let waveformOffset = 0;
+
+async function analyzeAudio() {
+  if (!source) return;
+  progress(2, "波形を分析中…", "音量・沈黙区間を計算");
+  const ctx = new AudioContext();
+  try {
+    const buf = await source.arrayBuffer();
+    audioBuffer = await ctx.decodeAudioData(buf);
+    const ch = audioBuffer.numberOfChannels;
+    const len = audioBuffer.length;
+    const sr = audioBuffer.sampleRate;
+    const duration = audioBuffer.duration;
+
+    // モノラル化
+    const mono = new Float32Array(len);
+    if (ch === 1) {
+      mono.set(audioBuffer.getChannelData(0));
+    } else {
+      for (let i = 0; i < len; i++) { let s = 0; for (let c = 0; c < ch; c++) s += audioBuffer.getChannelData(c)[i]; mono[i] = s / ch; }
+    }
+
+    // 波形データをピークホールドでサンプリング（描画用）
+    const pixels = Math.min(len, 4000); // 最大4000ポイント
+    const block = Math.floor(len / pixels);
+    waveformData = [];
+    for (let i = 0; i < pixels; i++) {
+      let min = 0, max = 0;
+      for (let j = 0; j < block; j++) {
+        const s = mono[i * block + j];
+        if (s < min) min = s;
+        if (s > max) max = s;
+      }
+      waveformData.push({ min, max });
+    }
+
+    // RMS音量を計算（100msウィンドウ）
+    const windowSize = Math.floor(sr * 0.1);
+    const rms = [];
+    for (let i = 0; i < len; i += windowSize) {
+      let sum = 0;
+      const end = Math.min(i + windowSize, len);
+      for (let j = i; j < end; j++) sum += mono[j] * mono[j];
+      rms.push({ time: i / sr, value: Math.sqrt(sum / (end - i)) });
+    }
+
+    // 沈黙区間の検出（RMS < 閾値、0.5秒以上）
+    const threshold = 0.02;
+    const minSilence = 0.5;
+    silenceRegions = [];
+    let silenceStart = null;
+    for (const p of rms) {
+      if (p.value < threshold) {
+        if (silenceStart === null) silenceStart = p.time;
+      } else {
+        if (silenceStart !== null && p.time - silenceStart >= minSilence) {
+          silenceRegions.push({ start: silenceStart, end: p.time });
+        }
+        silenceStart = null;
+      }
+    }
+    if (silenceStart !== null && duration - silenceStart >= minSilence) {
+      silenceRegions.push({ start: silenceStart, end: duration });
+    }
+
+    // 話者切り替わり候補（沈黙後の音量変化 + 文字起こしセグメント境界）
+    speakerRegions = [];
+    let lastEnd = 0;
+    for (const seg of segments) {
+      if (seg.start - lastEnd > 0.3) {
+        speakerRegions.push({ time: seg.start, type: "boundary" });
+      }
+      lastEnd = seg.end;
+    }
+    // 沈黙区間の中央も話者切り替わり候補
+    for (const s of silenceRegions) {
+      const mid = (s.start + s.end) / 2;
+      if (!speakerRegions.some(r => Math.abs(r.time - mid) < 0.5)) {
+        speakerRegions.push({ time: mid, type: "silence" });
+      }
+    }
+    speakerRegions.sort((a, b) => a.time - b.time);
+
+    $("waveformCard").hidden = false;
+    renderWaveform();
+    progress(5, "波形分析完了", `沈黙区間: ${silenceRegions.length}件`);
+  } finally {
+    ctx.close();
+  }
+}
+
+function renderWaveform() {
+  const canvas = $("waveform");
+  if (!canvas || !waveformData) return;
+  const wrap = $("waveformWrap");
+  canvas.width = wrap.clientWidth;
+  canvas.height = 160;
+  drawWaveform();
+}
+
+function drawWaveform() {
+  const canvas = $("waveform");
+  const ctx = canvas.getContext("2d");
+  const w = canvas.width;
+  const h = canvas.height;
+  const data = waveformData;
+  if (!data) return;
+
+  ctx.clearRect(0, 0, w, h);
+  const mid = h / 2;
+  const duration = audioBuffer?.duration || 1;
+
+  // 表示範囲
+  const viewStart = waveformOffset;
+  const viewEnd = waveformOffset + duration / waveformZoom;
+  const startIdx = Math.floor((viewStart / duration) * data.length);
+  const endIdx = Math.ceil((viewEnd / duration) * data.length);
+  const visible = data.slice(Math.max(0, startIdx), Math.min(data.length, endIdx));
+  const pxPerSample = w / visible.length;
+
+  // 波形描画
+  ctx.strokeStyle = "#4a90d9";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let i = 0; i < visible.length; i++) {
+    const x = i * pxPerSample;
+    const top = mid + visible[i].max * mid * 0.95;
+    const bottom = mid + visible[i].min * mid * 0.95;
+    ctx.moveTo(x, top);
+    ctx.lineTo(x, bottom);
+  }
+  ctx.stroke();
+
+  // 中心線
+  ctx.strokeStyle = "#ddd";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, mid);
+  ctx.lineTo(w, mid);
+  ctx.stroke();
+
+  // 沈黙区間をハイライト
+  for (const s of silenceRegions) {
+    if (s.end < viewStart || s.start > viewEnd) continue;
+    const x1 = ((s.start - viewStart) / (viewEnd - viewStart)) * w;
+    const x2 = ((s.end - viewStart) / (viewEnd - viewStart)) * w;
+    ctx.fillStyle = "rgba(255, 200, 50, 0.25)";
+    ctx.fillRect(x1, 0, x2 - x1, h);
+    ctx.strokeStyle = "rgba(255, 160, 0, 0.6)";
+    ctx.strokeRect(x1, 0, x2 - x1, h);
+  }
+
+  // 話者切り替わり候補
+  for (const r of speakerRegions) {
+    if (r.time < viewStart || r.time > viewEnd) continue;
+    const x = ((r.time - viewStart) / (viewEnd - viewStart)) * w;
+    ctx.strokeStyle = r.type === "boundary" ? "rgba(200, 50, 200, 0.7)" : "rgba(50, 200, 100, 0.7)";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, h);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // 文字起こしセグメント境界
+  for (const seg of segments) {
+    if (seg.start < viewStart || seg.start > viewEnd) continue;
+    const x = ((seg.start - viewStart) / (viewEnd - viewStart)) * w;
+    ctx.strokeStyle = "rgba(100, 100, 255, 0.5)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, h);
+    ctx.stroke();
+  }
+
+  // 情報表示
+  $("waveformInfo").textContent = `表示: ${fmt(viewStart)} - ${fmt(viewEnd)} · ズーム: ${waveformZoom.toFixed(1)}x`;
+}
+
+// 波形操作イベント
+function setupWaveformEvents() {
+  const canvas = $("waveform");
+  if (!canvas) return;
+
+  canvas.addEventListener("click", e => {
+    const rect = canvas.getBoundingClientRect();
+    const ratio = (e.clientX - rect.left) / rect.width;
+    const duration = audioBuffer?.duration || 1;
+    const viewStart = waveformOffset;
+    const viewEnd = waveformOffset + duration / waveformZoom;
+    const time = viewStart + ratio * (viewEnd - viewStart);
+    seekOriginal(time);
+  });
+
+  $("waveformZoomIn").addEventListener("click", () => {
+    waveformZoom = Math.min(waveformZoom * 2, 64);
+    drawWaveform();
+  });
+  $("waveformZoomOut").addEventListener("click", () => {
+    waveformZoom = Math.max(waveformZoom / 2, 1);
+    waveformOffset = 0;
+    drawWaveform();
+  });
+  $("waveformReset").addEventListener("click", () => {
+    waveformZoom = 1;
+    waveformOffset = 0;
+    drawWaveform();
+  });
+
+  // マウスホイールでズーム・スクロール
+  canvas.addEventListener("wheel", e => {
+    e.preventDefault();
+    const duration = audioBuffer?.duration || 1;
+    if (e.shiftKey) {
+      // スクロール
+      const delta = e.deltaY > 0 ? 0.05 : -0.05;
+      waveformOffset = Math.max(0, Math.min(duration - duration / waveformZoom, waveformOffset + delta * duration / waveformZoom));
+    } else {
+      // ズーム
+      const rect = canvas.getBoundingClientRect();
+      const ratio = (e.clientX - rect.left) / rect.width;
+      const viewStart = waveformOffset;
+      const viewEnd = waveformOffset + duration / waveformZoom;
+      const cursorTime = viewStart + ratio * (viewEnd - viewStart);
+      if (e.deltaY > 0) waveformZoom = Math.max(1, waveformZoom / 1.5);
+      else waveformZoom = Math.min(64, waveformZoom * 1.5);
+      const newViewWidth = duration / waveformZoom;
+      waveformOffset = Math.max(0, Math.min(duration - newViewWidth, cursorTime - ratio * newViewWidth));
+    }
+    drawWaveform();
+  });
+
+  window.addEventListener("resize", () => renderWaveform());
+}
+
+$("analyzeWaveform").onclick = analyzeAudio;
+\n$("transcribe").onclick = async () => {
   $("transcribe").disabled = true;
-  try { progress(2, "文字起こしを準備中…"); segments = await transcribe(); $("transcript").value = segments.map(s => `[${fmt(s.start)} - ${fmt(s.end)}] ${s.text}`).join("\n"); $("transcriptCard").hidden = false; $("transcriptCard").scrollIntoView({ behavior: "smooth" }); }
+  try { progress(2, "文字起こしを準備中…"); segments = await transcribe(); renderTranscriptUI(); $("transcriptCard").hidden = false; $("transcriptCard").scrollIntoView({ behavior: "smooth" }); }
   catch (e) { alert("文字起こしに失敗しました: " + e.message); progress(0, "エラー", e.message); }
   finally { $("transcribe").disabled = false; }
 };
-function transcriptObject() { return { version: 1, language: $("language").value, source_file: source?.name, segments }; }
-function promptText() {
-  return `あなたはポッドキャストの編集ディレクターです。以下のタイムスタンプ付き文字起こしを読み、編集指示JSONを作成してください。\n\n方針:\n- 会話の意味を損なわない。発言の途中を切らない。\n- 不要な長い沈黙、明確な言い直し、重複だけを慎重に候補化する。\n- 話題転換には必要に応じてジングルを置く。\n- BGMは会話を邪魔しない音量にする。\n- 不確かな編集は実行せず、notesに理由を書く。\n\n出力は説明文やMarkdown囲みなしのJSONのみ。形式:\n{"version":1,"operations":[{"type":"cut","start":12.5,"end":18.2,"reason":"理由"},{"type":"bgm","start":0,"end":60,"track":"main","volume":0.12,"fade_in":2,"fade_out":3},{"type":"fade","start":58,"end":60,"effect":"out"},{"type":"marker","time":120,"label":"話題転換"}],"notes":["確認事項"]}\n\n利用可能な操作:\n- cut: start/end秒。音源から区間を削除\n- bgm: start/end秒、trackは"main"、volumeは0〜1、fade_in/fade_outは任意の秒数。BGMは指定区間だけ再生し、カットされた区間では元音源時間に沿って進める\n- fade: start/end秒、effectは"in"または"out"。指定範囲で音量をフェード\n- marker: time秒、label文字列（編集目印のみ）\n\n時刻はすべて元音源上の秒数です。音源の長さを超えないでください。カット区間を重複させないでください。\n\n文字起こし:\n${$("transcript").value}`;
+
+function renderTranscriptUI() {
+  const container = $("transcriptContainer");
+  const textarea = $("transcript");
+  if (!container || !textarea) return;
+  container.innerHTML = "";
+  textarea.value = segments.map(s => `[${fmt(s.start)} - ${fmt(s.end)}] ${s.speaker !== "unknown" ? "[" + s.speaker + "] " : ""}${s.text}`).join("\n");
+
+  segments.forEach((seg, idx) => {
+    const row = document.createElement("div");
+    row.className = `seg speaker-${seg.speaker || "unknown"}`;
+
+    const time = document.createElement("div");
+    time.className = "seg-time";
+    time.textContent = `${fmt(seg.start)} - ${fmt(seg.end)}`;
+    time.title = "この時刻に再生";
+    time.addEventListener("click", () => seekOriginal(seg.start));
+
+    const speakerDiv = document.createElement("div");
+    speakerDiv.className = "seg-speaker";
+    const select = document.createElement("select");
+    ["unknown", "A", "B", "C", "D"].forEach(sp => {
+      const opt = document.createElement("option");
+      opt.value = sp;
+      opt.textContent = sp === "unknown" ? "話者？" : `話者 ${sp}`;
+      if (seg.speaker === sp) opt.selected = true;
+      select.append(opt);
+    });
+    select.addEventListener("change", e => {
+      seg.speaker = e.target.value;
+      renderTranscriptUI();
+    });
+    speakerDiv.append(select);
+
+    const text = document.createElement("div");
+    text.className = "seg-text";
+    text.textContent = seg.text;
+
+    row.append(time, speakerDiv, text);
+    container.append(row);
+  });
 }
+
+$("autoSpeaker").onclick = () => {
+  if (!segments.length) return;
+  let current = "A";
+  segments[0].speaker = current;
+  for (let i = 1; i < segments.length; i++) {
+    const gap = segments[i].start - segments[i - 1].end;
+    if (gap > 1.5) current = current === "A" ? "B" : "A";
+    segments[i].speaker = current;
+  }
+  renderTranscriptUI();
+};
+
+function transcriptObject() {
+  return { version: 1, language: $("language").value, source_file: source?.name, segments: segments.map(s => ({ start: s.start, end: s.end, text: s.text, speaker: s.speaker || "unknown" })) };
+}
+
+function promptText() {
+  const speakerLines = segments.map(s => `[${fmt(s.start)} - ${fmt(s.end)}] ${s.speaker !== "unknown" ? "[" + s.speaker + "] " : ""}${s.text}`).join("\n");
+  return `あなたはポッドキャストの編集ディレクターです。以下のタイムスタンプ付き文字起こしを読み、編集指示JSONを作成してください。\n\n方針:\n- 会話の意味を損なわない。発言の途中を切らない。\n- 不要な長い沈黙、明確な言い直し、重複だけを慎重に候補化する。\n- 話題転換には必要に応じてジングルを置く。\n- BGMは会話を邪魔しない音量にする。\n- 不確かな編集は実行せず、notesに理由を書く。\n\n出力は説明文やMarkdown囲みなしのJSONのみ。形式:\n{"version":1,"operations":[{"type":"cut","start":12.5,"end":18.2,"reason":"理由"},{"type":"bgm","start":0,"end":60,"track":"main","volume":0.12,"fade_in":2,"fade_out":3},{"type":"fade","start":58,"end":60,"effect":"out"},{"type":"marker","time":120,"label":"話題転換"}],"notes":["確認事項"]}\n\n利用可能な操作:\n- cut: start/end秒。音源から区間を削除\n- bgm: start/end秒、trackは"main"、volumeは0〜1、fade_in/fade_outは任意の秒数。BGMは指定区間だけ再生し、カットされた区間では元音源時間に沿って進める\n- fade: start/end秒、effectは"in"または"out"。指定範囲で音量をフェード\n- marker: time秒、label文字列（編集目印のみ）\n\n時刻はすべて元音源上の秒数です。音源の長さを超えないでください。カット区間を重複させないでください。\n\n文字起こし:\n${speakerLines}`;
+}
+
 $("copyPrompt").onclick = async () => { try { await navigator.clipboard.writeText(promptText()); $("copyPrompt").textContent = "コピーしました"; } catch { $("transcript").value = promptText(); alert("コピーできないため、文字起こし欄に依頼を表示しました。"); } };
 function dl(text, name, type) { const u = URL.createObjectURL(new Blob([text], { type })), a = document.createElement("a"); a.href = u; a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(u), 1000); }
 $("downloadTranscript").onclick = () => dl($("transcript").value, "transcript.txt", "text/plain;charset=utf-8");
@@ -322,3 +631,4 @@ $("execute").onclick = async () => {
   }
   finally { $("execute").disabled = false; }
 };
+\nsetupWaveformEvents();\n
