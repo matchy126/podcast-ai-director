@@ -38,42 +38,20 @@ async function transcribe() {
 }
 $("transcribe").onclick = async () => {
   $("transcribe").disabled = true;
-  try { progress(2, "文字起こしを準備中…"); segments = await transcribe(); $("transcript").value = segments.map(s => `[${fmt(s.start)} - ${fmt(s.end)}] ${s.text}`).join("
-"); $("transcriptCard").hidden = false; $("transcriptCard").scrollIntoView({ behavior: "smooth" }); }
-  catch (e) { alert("文字起こしに失敗しました: " + e.message); progress(0, "ラー", e.message); }
+  try { progress(2, "文字起こしを準備中…"); segments = await transcribe(); $("transcript").value = segments.map(s => `[${fmt(s.start)} - ${fmt(s.end)}] ${s.text}`).join("\n"); $("transcriptCard").hidden = false; $("transcriptCard").scrollIntoView({ behavior: "smooth" }); }
+  catch (e) { alert("文字起こしに失敗しました: " + e.message); progress(0, "エラー", e.message); }
   finally { $("transcribe").disabled = false; }
 };
 function transcriptObject() { return { version: 1, language: $("language").value, source_file: source?.name, segments }; }
 function promptText() {
-  return `あなたはポッドキャストの編集ディレクターです。以下のタイムスタンプ付き文字起こしを読み、編集指示JSONを作成してください。
-
-方針:
-- 会話の意味を損なわない。発言の途中を切らない。
-- 不要な長い沈黙、明確な言い直し、重複だけを慎重に候補化する。
-- 話題転換には必要に応じてジングルを置く。
-- BGMは会話を邪魔しない音量にする。
-- 不確かな編集は実行せず、notesに理由を書く。
-
-出力は説明文やMarkdown囲みなしのJSONのみ。形式:
-{"version":1,"operations":[{"type":"cut","start":12.5,"end":18.2,"reason":"理由"},{"type":"bgm","start":0,"end":60,"track":"main","volume":0.12,"fade_in":2,"fade_out":3},{"type":"fade","start":58,"end":60,"effect":"out"},{"type":"marker","time":120,"label":"話題転換"}],"notes":["確認事項"]}
-
-利用可能な操作:
-- cut: start/end秒。音源から区間を削除
-- bgm: start/end秒、trackは"main"、volumeは0〜1、fade_in/fade_outは任意の秒数。BGMは指定区間だけ再生し、カットされた区間では元音源時間に沿って進める
-- fade: start/end秒、effectは"in"または"out"。指定範囲で音量をフェード
-- marker: time秒、label文字列（編集目印のみ）
-
-時刻はすべて元音源上の秒数です。音源の長さを超えないでください。カット区間を重複させないでください。
-
-文字起こし:
-${$("transcript").value}`;
+  return `あなたはポッドキャストの編集ディレクターです。以下のタイムスタンプ付き文字起こしを読み、編集指示JSONを作成してください。\n\n方針:\n- 会話の意味を損なわない。発言の途中を切らない。\n- 不要な長い沈黙、明確な言い直し、重複だけを慎重に候補化する。\n- 話題転換には必要に応じてジングルを置く。\n- BGMは会話を邪魔しない音量にする。\n- 不確かな編集は実行せず、notesに理由を書く。\n\n出力は説明文やMarkdown囲みなしのJSONのみ。形式:\n{"version":1,"operations":[{"type":"cut","start":12.5,"end":18.2,"reason":"理由"},{"type":"bgm","start":0,"end":60,"track":"main","volume":0.12,"fade_in":2,"fade_out":3},{"type":"fade","start":58,"end":60,"effect":"out"},{"type":"marker","time":120,"label":"話題転換"}],"notes":["確認事項"]}\n\n利用可能な操作:\n- cut: start/end秒。音源から区間を削除\n- bgm: start/end秒、trackは"main"、volumeは0〜1、fade_in/fade_outは任意の秒数。BGMは指定区間だけ再生し、カットされた区間では元音源時間に沿って進める\n- fade: start/end秒、effectは"in"または"out"。指定範囲で音量をフェード\n- marker: time秒、label文字列（編集目印のみ）\n\n時刻はすべて元音源上の秒数です。音源の長さを超えないでください。カット区間を重複させないでください。\n\n文字起こし:\n${$("transcript").value}`;
 }
 $("copyPrompt").onclick = async () => { try { await navigator.clipboard.writeText(promptText()); $("copyPrompt").textContent = "コピーしました"; } catch { $("transcript").value = promptText(); alert("コピーできないため、文字起こし欄に依頼文を表示しました。"); } };
 function dl(text, name, type) { const u = URL.createObjectURL(new Blob([text], { type })), a = document.createElement("a"); a.href = u; a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(u), 1000); }
 $("downloadTranscript").onclick = () => dl($("transcript").value, "transcript.txt", "text/plain;charset=utf-8");
 $("downloadTranscriptJson").onclick = () => dl(JSON.stringify(transcriptObject(), null, 2), "transcript.json", "application/json");
 $("jsonFile").onchange = async e => { const f = e.target.files[0]; if (f) $("instructions").value = await f.text(); };
-$("sample").onclick = () => { $("instructions").value = JSON.stringify({ version: 1, operations: [{ type: "cut", start: 10, end: 13, reason: "サンプルのカット" }, { type: "bgm", start: 0, end: 45, track: "main", volume: 0.1 }, { type: "fade", start: 43, end: 45, effect: "out" }, { type: "marker", time: 45, label: "話題転換" }], notes: ["サンプル指示です。実際の音源に合わせて刻を修正してください。"] }, null, 2); };
+$("sample").onclick = () => { $("instructions").value = JSON.stringify({ version: 1, operations: [{ type: "cut", start: 10, end: 13, reason: "サンプルのカット" }, { type: "bgm", start: 0, end: 45, track: "main", volume: 0.1 }, { type: "fade", start: 43, end: 45, effect: "out" }, { type: "marker", time: 45, label: "話題転換" }], notes: ["サンプル指示です。実際の音源に合わせて時刻を修正してください。"] }, null, 2); };
 
 function parseInstructions() {
   const obj = JSON.parse($("instructions").value);
@@ -135,27 +113,48 @@ function renderTimeline() {
 }
 let ffLoadPromise = null;
 async function loadFF() {
+  // Reuse only a fully initialized instance. A failed load must never leave a
+  // truthy FFmpeg object behind, otherwise later calls skip load() and fail
+  // with "ffmpeg is not loaded".
   if (ff && ff.loaded) return ff;
   if (ffLoadPromise) return ffLoadPromise;
+
   ffLoadPromise = (async () => {
     const candidate = new FFmpeg();
-    candidate.on("progress", ({ progress }) => { editProgress(45 + Math.round((progress || 0) * 45), "音声をレンダリング中…"); });
-    candidate.on("log", ({ message }) => { candidate.lastLog = message; });
+    candidate.on("progress", ({ progress }) => {
+      editProgress(45 + Math.round((progress || 0) * 45), "音声をレンダリング中…");
+    });
+    candidate.on("log", ({ message }) => {
+      // Keep FFmpeg logs out of blocking alert dialogs; surface useful details
+      // only when loading/execution fails.
+      candidate.lastLog = message;
+    });
+
     const base = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd";
     try {
       editProgress(8, "FFmpeg本体をダウンロード中…");
-      const [coreURL, wasmURL] = await Promise.all([ toBlobURL(base + "/ffmpeg-core.js", "text/javascript"), toBlobURL(base + "/ffmpeg-core.wasm", "application/wasm") ]);
+      const [coreURL, wasmURL] = await Promise.all([
+        toBlobURL(base + "/ffmpeg-core.js", "text/javascript"),
+        toBlobURL(base + "/ffmpeg-core.wasm", "application/wasm")
+      ]);
       editProgress(25, "FFmpegを初期化中…");
       await candidate.load({ coreURL, wasmURL });
       if (!candidate.loaded) throw new Error("FFmpegの初期化完了を確認できませんでした。");
-      ff = candidate; return candidate;
+      ff = candidate;
+      return candidate;
     } catch (error) {
       try { candidate.terminate(); } catch {}
-      ff = null; const detail = error?.message || String(error);
+      ff = null;
+      const detail = error?.message || String(error);
       throw new Error("FFmpegの読み込みに失敗しました。ページを再読み込みして再試行してください。詳細: " + detail);
     }
   })();
-  try { return await ffLoadPromise; } finally { ffLoadPromise = null; }
+
+  try {
+    return await ffLoadPromise;
+  } finally {
+    ffLoadPromise = null;
+  }
 }
 function mapOriginalTime(time, keep) {
   let offset = 0;
@@ -208,7 +207,10 @@ async function render() {
   let map = "[voice]";
   if (bgmPieces.length) { filters.push(`[voice]${bgmPieces.join("")}amix=inputs=${bgmPieces.length + 1}:duration=first:dropout_transition=0:normalize=0[mixed]`); map = "[mixed]"; }
   const fades = ops.filter(o => o.type === "fade");
-  fades.forEach((o, i) => { const s = mapOriginalTime(o.start, keep), e = mapOriginalTime(o.end, keep), d = Math.max(.01, e - s), next = `fade${i}`; filters.push(`${map}afade=t=${o.effect}:st=${s}:d=${d}[${next}]`); map = `[${next}]`; });
+  fades.forEach((o, i) => {
+    const s = mapOriginalTime(o.start, keep), e = mapOriginalTime(o.end, keep), d = Math.max(.01, e - s), next = `fade${i}`;
+    filters.push(`${map}afade=t=${o.effect}:st=${s}:d=${d}[${next}]`); map = `[${next}]`;
+  });
   const format = $("format").value, out = "final." + format;
   args.push("-filter_complex", filters.join(";"), "-map", map);
   if (format === "mp3") args.push("-c:a", "libmp3lame", "-b:a", "192k", out); else args.push("-c:a", "pcm_s16le", out);
@@ -226,7 +228,12 @@ $("execute").onclick = async () => {
   } catch (e) {
     editProgress(0, "編集できませんでした: " + (e?.message || String(e)));
     let errorBox = $("editError");
-    if (!errorBox) { errorBox = document.createElement("pre"); errorBox.id = "editError"; errorBox.className = "validation err"; $("editProgressBox").after(errorBox); }
+    if (!errorBox) {
+      errorBox = document.createElement("pre");
+      errorBox.id = "editError";
+      errorBox.className = "validation err";
+      $("editProgressBox").after(errorBox);
+    }
     errorBox.textContent = e?.stack || e?.message || String(e);
   }
   finally { $("execute").disabled = false; }

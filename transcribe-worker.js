@@ -5,17 +5,10 @@ const MODEL_IDS = {
   base: "onnx-community/whisper-base",
   small: "onnx-community/whisper-small"
 };
-
-let asrPromise = null;
-let currentModel = null;
+let asrPromise;
 
 async function getASR(model) {
-  // モデルが変わったらキャッシュを破棄
-  if (currentModel !== model && asrPromise) {
-    asrPromise = null;
-  }
   if (!asrPromise) {
-    currentModel = model;
     env.allowLocalModels = false;
     env.backends.onnx.wasm.numThreads = 1;
     env.backends.onnx.wasm.proxy = false;
@@ -32,7 +25,7 @@ async function getASR(model) {
             detail: p.file || p.name || "モデルファイルを取得中"
           });
         } else if (p.status === "done") {
-          self.postMessage({ type: "status", text: `${p.file || p.name || "モデルファイル"} 読み込み完了` });
+          self.postMessage({ type: "status", text: `${p.file || p.name || "モデルファイル"} 読み込み完了。推論エンジンを準備中…` });
         }
       }
     });
@@ -43,33 +36,41 @@ async function getASR(model) {
 self.onmessage = async event => {
   const data = event.data || {};
   if (data.type !== "transcribe") return;
-
   try {
     const asr = await getASR(data.model);
     const audio = new Float32Array(data.audio);
     const sampleRate = 16000;
-
-    self.postMessage({ type: "status", text: "音声を解析中…", detail: `${audio.length} samples @ ${sampleRate}Hz` });
-
-    // Whisper標準の chunk_length_s=30, stride_length_s=5 を使用
-    // Transformers.js の pipeline に任せる（長い音声を自動でチャンク処理）
-    const result = await asr(audio, {
-      sampling_rate: sampleRate,
-      language: data.language || "japanese",
-      task: "transcribe",
-      return_timestamps: true,
-      chunk_length_s: 30,
-      stride_length_s: 5
-    });
-
-    const chunks = result.chunks || [{ timestamp: [0, audio.length / sampleRate], text: result.text || "" }];
+    const chunkSeconds = 25;
+    const chunkSamples = chunkSeconds * sampleRate;
+    const totalChunks = Math.ceil(audio.length / chunkSamples);
     const segments = [];
-    for (const c of chunks) {
-      const start = Number(c.timestamp?.[0] ?? 0);
-      const end = Number(c.timestamp?.[1] ?? audio.length / sampleRate);
-      const text = (c.text || "").trim();
-      if (!text) continue;
-      segments.push({ start, end, text });
+
+    self.postMessage({ type: "started", totalChunks, duration: audio.length / sampleRate });
+
+    for (let i = 0; i < totalChunks; i++) {
+      const startSample = i * chunkSamples;
+      const endSample = Math.min(audio.length, startSample + chunkSamples);
+      const part = audio.slice(startSample, endSample);
+      const offset = startSample / sampleRate;
+      self.postMessage({ type: "status", text: `音声を解析中…（${i + 1}/${totalChunks} 区間）` });
+
+      const result = await asr(part, {
+        sampling_rate: sampleRate,
+        language: data.language || "japanese",
+        task: "transcribe",
+        return_timestamps: true
+      });
+
+      const chunks = result.chunks || [{ timestamp: [0, part.length / sampleRate], text: result.text || "" }];
+      for (const c of chunks) {
+        const localStart = Number(c.timestamp?.[0] ?? 0);
+        const localEnd = Number(c.timestamp?.[1] ?? part.length / sampleRate);
+        const text = (c.text || "").trim();
+        if (!text) continue;
+        segments.push({ start: offset + localStart, end: offset + localEnd, text });
+      }
+
+      self.postMessage({ type: "chunk-progress", completed: i + 1, total: totalChunks });
     }
 
     self.postMessage({ type: "result", segments });
