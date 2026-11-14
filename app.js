@@ -45,9 +45,10 @@ function setActiveStep(stepNum) {
 }
 
 function progress(p, t, d = "") {
+  const safe = Math.min(100, Math.max(0, Number(p) || 0));
   $("progressbox").hidden = false;
-  $("progress").value = p;
-  $("progressNum").textContent = `${p}%`;
+  $("progress").value = safe;
+  $("progressNum").textContent = safe > 0 && safe < 100 ? `${safe.toFixed(1)}%` : `${Math.round(safe)}%`;
   $("progressText").textContent = t;
   $("progressDetail").textContent = d;
 }
@@ -202,7 +203,7 @@ async function decodeAudioTo16kMono(file) {
 
 function getWorker() {
   if (!activeWorker) {
-    activeWorker = new Worker("./transcribe-worker.js?v=0.6.5", { type: "module" });
+    activeWorker = new Worker("./transcribe-worker.js?v=0.6.6", { type: "module" });
   }
   return activeWorker;
 }
@@ -215,9 +216,9 @@ function resetWorker() {
 }
 
 async function transcribe() {
-  progress(3, "音声ファイルをデコード中…", "16kHz モノラル形式へ変換しています");
+  progress(2, "音声ファイルをデコード中…", "16kHz モノラル形式へ変換しています");
   const mono16k = await decodeAudioTo16kMono(source);
-  progress(8, "AIワーカーへ音声データを転送中…", `${(mono16k.byteLength / 1048576).toFixed(1)} MB`);
+  progress(5, "AIワーカーへ音声データを転送中…", `${(mono16k.byteLength / 1048576).toFixed(1)} MB`);
 
   const worker = getWorker();
   return new Promise((resolve, reject) => {
