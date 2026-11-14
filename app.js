@@ -26,16 +26,103 @@ $("drop").ondragover = e => e.preventDefault();
 $("drop").ondrop = e => { e.preventDefault(); setAudio(e.dataTransfer.files[0]); };
 $("bgm").onchange = e => { bgm = e.target.files[0] || null; $("bgmName").textContent = bgm ? `選択中：${bgm.name}` : "BGM未選択"; };
 
+/* === 音声前処理：繰り返し対策 === */
+async function preprocessAudio(file) {
+  progress(3, "音声をクリーンアップ中…", "サンプリングレート統一・ノイズ除去");
+  const ctx = new AudioContext({ sampleRate: 16000 });
+  try {
+    const buf = await file.arrayBuffer();
+    const decoded = await ctx.decodeAudioData(buf);
+    const len = decoded.length;
+    const ch = decoded.numberOfChannels;
+    const mono = new Float32Array(len);
+    for (let i = 0; i < len; i++) { let s = 0; for (let c = 0; c < ch; c++) s += decoded.getChannelData(c)[i]; mono[i] = s / ch; }
+    // ハイパスフィルタ（200Hz以下カット）でノイズ・ハウリング除去
+    const filtered = new Float32Array(len);
+    const RC = 1.0 / (2 * Math.PI * 200);
+    const dt = 1.0 / 16000;
+    const alpha = RC / (RC + dt);
+    filtered[0] = mono[0];
+    for (let i = 1; i < len; i++) filtered[i] = alpha * (filtered[i - 1] + mono[i] - mono[i - 1]);
+    // ピークノーマライズ
+    let peak = 0; for (let i = 0; i < len; i++) { const a = Math.abs(filtered[i]); if (a > peak) peak = a; }
+    if (peak > 0) for (let i = 0; i < len; i++) filtered[i] /= peak;
+    // WAV にエンコードして Blob 化
+    const wavBuf = encodeWav(filtered, 16000);
+    return new Blob([wavBuf], { type: "audio/wav" });
+  } finally { ctx.close(); }
+}
+function encodeWav(samples, sampleRate) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+  const writeString = (offset, string) => { for (let i = 0; i < string.length; i++) view.setUint8(offset + i, string.charCodeAt(i)); };
+  writeString(0, "RIFF"); view.setUint32(4, 36 + samples.length * 2, true); writeString(8, "WAVE");
+  writeString(12, "fmt "); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  writeString(36, "data"); view.setUint32(40, samples.length * 2, true);
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++) { let s = Math.max(-1, Math.min(1, samples[i])); s = s < 0 ? s * 0x8000 : s * 0x7FFF; view.setInt16(offset, s, true); offset += 2; }
+  return buffer;
+}
+
+/* === 文字起こし後処理：繰り返し除去 === */
+function cleanTranscript(text) {
+  if (!text) return "";
+  let s = text;
+  // 1文字の繰り返し（5, ガ, そ, う など）を 3回以上 → 1回
+  s = s.replace(/(\S)\1{10,}/g, "$1");
+  // 2〜4文字のパターン繰り返し（「ガンガン」「そうから」「ありがとうございます」など）
+  s = s.replace(/(\S{2,4})(?:\s*\1){5,}/g, "$1");
+  // 単語レベルの 3回以上繰り返し（空白込み）
+  s = s.replace(/\b(\S+)(?:\s+\1){3,}\b/g, "$1 $1");
+  // 句読点だけの繰り返しは残す
+  s = s.replace(/([。、\.\,])\1{10,}/g, "$1");
+  // 長い空白・改行を整理
+  s = s.replace(/\n{4,}/g, "\n\n");
+  return s.trim();
+}
+
 async function transcribe() {
   const models = { tiny: "onnx-community/whisper-tiny", base: "onnx-community/whisper-base", small: "onnx-community/whisper-small" };
   env.allowLocalModels = false;
   const asr = await pipeline("automatic-speech-recognition", models[$("model").value], { dtype: "q8", progress_callback: p => { if (p.status === "progress") progress(5 + Math.round((p.progress || 0) * .45), "AIモデルをダウンロード中…", p.file || ""); } });
-  const url = URL.createObjectURL(source);
+  const cleanBlob = await preprocessAudio(source);
+  const url = URL.createObjectURL(cleanBlob);
   try {
-    const r = await asr(url, { language: $("language").value, task: "transcribe", chunk_length_s: 25, stride_length_s: 5, return_timestamps: true });
-    return (r.chunks || [{ timestamp: [0, null], text: r.text }]).map(c => ({ start: Number(c.timestamp?.[0] || 0), end: Number(c.timestamp?.[1] || 0), text: (c.text || "").trim() })).filter(x => x.text);
+    const r = await asr(url, { language: $("language").value, task: "transcribe", chunk_length_s: 30, stride_length_s: 5, return_timestamps: true });
+    let chunks = (r.chunks || [{ timestamp: [0, null], text: r.text }]).map(c => ({ start: Number(c.timestamp?.[0] || 0), end: Number(c.timestamp?.[1] || 0), text: cleanTranscript((c.text || "").trim()) })).filter(x => x.text);
+    // チャンク間の重複テキストを除去
+    chunks = mergeOverlappingChunks(chunks);
+    return chunks;
   } finally { URL.revokeObjectURL(url); }
 }
+
+function mergeOverlappingChunks(chunks) {
+  if (chunks.length < 2) return chunks;
+  const out = [chunks[0]];
+  for (let i = 1; i < chunks.length; i++) {
+    const prev = out[out.length - 1];
+    const cur = chunks[i];
+    const overlap = findOverlap(prev.text, cur.text);
+    if (overlap.length > 3) {
+      prev.text = prev.text.slice(0, prev.text.lastIndexOf(overlap)) + overlap;
+      prev.end = cur.end;
+      cur.text = cur.text.slice(overlap.length).trim();
+      if (cur.text) out.push(cur);
+    } else {
+      out.push(cur);
+    }
+  }
+  return out;
+}
+function findOverlap(a, b) {
+  const max = Math.min(a.length, b.length);
+  for (let i = max; i > 2; i--) {
+    if (a.slice(-i) === b.slice(0, i)) return b.slice(0, i);
+  }
+  return "";
+}
+
 $("transcribe").onclick = async () => {
   $("transcribe").disabled = true;
   try { progress(2, "文字起こしを準備中…"); segments = await transcribe(); $("transcript").value = segments.map(s => `[${fmt(s.start)} - ${fmt(s.end)}] ${s.text}`).join("\n"); $("transcriptCard").hidden = false; $("transcriptCard").scrollIntoView({ behavior: "smooth" }); }
@@ -46,12 +133,12 @@ function transcriptObject() { return { version: 1, language: $("language").value
 function promptText() {
   return `あなたはポッドキャストの編集ディレクターです。以下のタイムスタンプ付き文字起こしを読み、編集指示JSONを作成してください。\n\n方針:\n- 会話の意味を損なわない。発言の途中を切らない。\n- 不要な長い沈黙、明確な言い直し、重複だけを慎重に候補化する。\n- 話題転換には必要に応じてジングルを置く。\n- BGMは会話を邪魔しない音量にする。\n- 不確かな編集は実行せず、notesに理由を書く。\n\n出力は説明文やMarkdown囲みなしのJSONのみ。形式:\n{"version":1,"operations":[{"type":"cut","start":12.5,"end":18.2,"reason":"理由"},{"type":"bgm","start":0,"end":60,"track":"main","volume":0.12,"fade_in":2,"fade_out":3},{"type":"fade","start":58,"end":60,"effect":"out"},{"type":"marker","time":120,"label":"話題転換"}],"notes":["確認事項"]}\n\n利用可能な操作:\n- cut: start/end秒。音源から区間を削除\n- bgm: start/end秒、trackは"main"、volumeは0〜1、fade_in/fade_outは任意の秒数。BGMは指定区間だけ再生し、カットされた区間では元音源時間に沿って進める\n- fade: start/end秒、effectは"in"または"out"。指定範囲で音量をフェード\n- marker: time秒、label文字列（編集目印のみ）\n\n時刻はすべて元音源上の秒数です。音源の長さを超えないでください。カット区間を重複させないでください。\n\n文字起こし:\n${$("transcript").value}`;
 }
-$("copyPrompt").onclick = async () => { try { await navigator.clipboard.writeText(promptText()); $("copyPrompt").textContent = "コピーしました"; } catch { $("transcript").value = promptText(); alert("コピーできないため、文字起こし欄に依頼文を表示しました。"); } };
+$("copyPrompt").onclick = async () => { try { await navigator.clipboard.writeText(promptText()); $("copyPrompt").textContent = "コピーしました"; } catch { $("transcript").value = promptText(); alert("コピーできないため、文字起こし欄に依頼を表示しました。"); } };
 function dl(text, name, type) { const u = URL.createObjectURL(new Blob([text], { type })), a = document.createElement("a"); a.href = u; a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(u), 1000); }
 $("downloadTranscript").onclick = () => dl($("transcript").value, "transcript.txt", "text/plain;charset=utf-8");
 $("downloadTranscriptJson").onclick = () => dl(JSON.stringify(transcriptObject(), null, 2), "transcript.json", "application/json");
 $("jsonFile").onchange = async e => { const f = e.target.files[0]; if (f) $("instructions").value = await f.text(); };
-$("sample").onclick = () => { $("instructions").value = JSON.stringify({ version: 1, operations: [{ type: "cut", start: 10, end: 13, reason: "サンプルのカット" }, { type: "bgm", start: 0, end: 45, track: "main", volume: 0.1 }, { type: "fade", start: 43, end: 45, effect: "out" }, { type: "marker", time: 45, label: "話題転換" }], notes: ["サンプル指示です。実際の音源に合わせて時刻を修正してください。"] }, null, 2); };
+$("sample").onclick = () => { $("instructions").value = JSON.stringify({ version: 1, operations: [{ type: "cut", start: 10, end: 13, reason: "サンプルのカット" }, { type: "bgm", start: 0, end: 45, track: "main", volume: 0.1 }, { type: "fade", start: 43, end: 45, effect: "out" }, { type: "marker", time: 45, label: "話題転換" }], notes: ["サンプル指示です。実際の音に合わせて時刻を修正してください。"] }, null, 2); };
 
 function parseInstructions() {
   const obj = JSON.parse($("instructions").value);
@@ -73,7 +160,7 @@ function validate() {
     const cuts = validated.operations.filter(o => o.type === "cut").sort((a, b) => a.start - b.start);
     for (let i = 1; i < cuts.length; i++) if (cuts[i].start < cuts[i - 1].end) throw Error("カット区間が重複しています。");
     if (sourceDuration) for (const o of validated.operations) { const end = o.type === "marker" ? o.time : o.end; if (end > sourceDuration + .05) throw Error(`操作時刻 ${fmt(end)} が音源長 ${fmt(sourceDuration)} を超えています。`); }
-    $("validation").className = "validation ok"; $("validation").textContent = `検証OK：${validated.operations.length}件の操作。時刻は元音源基準です。`; renderOps(); renderTimeline(); $("editCard").hidden = false; return true;
+    $("validation").className = "validation ok"; $("validation").textContent = `検証OK：${validated.operations.length}件の操作。時刻は元音源基です。`; renderOps(); renderTimeline(); $("editCard").hidden = false; return true;
   } catch (e) { validated = null; $("validation").className = "validation err"; $("validation").textContent = "JSONエラー：" + e.message; $("editCard").hidden = true; return false; }
 }
 $("validate").onclick = validate;
@@ -113,9 +200,6 @@ function renderTimeline() {
 }
 let ffLoadPromise = null;
 async function loadFF() {
-  // Reuse only a fully initialized instance. A failed load must never leave a
-  // truthy FFmpeg object behind, otherwise later calls skip load() and fail
-  // with "ffmpeg is not loaded".
   if (ff && ff.loaded) return ff;
   if (ffLoadPromise) return ffLoadPromise;
 
@@ -125,20 +209,20 @@ async function loadFF() {
       editProgress(45 + Math.round((progress || 0) * 45), "音声をレンダリング中…");
     });
     candidate.on("log", ({ message }) => {
-      // Keep FFmpeg logs out of blocking alert dialogs; surface useful details
-      // only when loading/execution fails.
       candidate.lastLog = message;
     });
 
     const base = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd";
+    const workerSrc = "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/worker.js";
     try {
       editProgress(8, "FFmpeg本体をダウンロード中…");
-      const [coreURL, wasmURL] = await Promise.all([
+      const [coreURL, wasmURL, workerURL] = await Promise.all([
         toBlobURL(base + "/ffmpeg-core.js", "text/javascript"),
-        toBlobURL(base + "/ffmpeg-core.wasm", "application/wasm")
+        toBlobURL(base + "/ffmpeg-core.wasm", "application/wasm"),
+        toBlobURL(workerSrc, "text/javascript")
       ]);
       editProgress(25, "FFmpegを初期化中…");
-      await candidate.load({ coreURL, wasmURL });
+      await candidate.load({ coreURL, wasmURL, classWorkerURL: workerURL });
       if (!candidate.loaded) throw new Error("FFmpegの初期化完了を確認できませんでした。");
       ff = candidate;
       return candidate;
