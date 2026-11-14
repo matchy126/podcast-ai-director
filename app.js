@@ -9,7 +9,14 @@ const fmt = s => { const m = Math.floor(s / 60), x = (s % 60).toFixed(1).padStar
 function progress(p, t, d = "") { $("progressbox").hidden = false; $("progress").value = p; $("progressNum").textContent = p + "%"; $("progressText").textContent = t; $("progressDetail").textContent = d; }
 function editProgress(p, t) { $("editProgressBox").hidden = false; $("editProgress").value = p; $("editProgressNum").textContent = p + "%"; $("editProgressText").textContent = t; }
 
-$("audio").onchange = e => setAudio(e.target.files[0]);
+// === グローバルエラーハンドリング ===
+window.addEventListener("error", e => {
+  console.error("Global error:", e.error);
+  const box = $("globalError") || document.createElement("pre");
+  if (!box.id) { box.id = "globalError"; box.className = "validation err"; document.body.prepend(box); }
+  box.textContent = "初期化エラー: " + (e.error?.message || String(e.error)) + "\\n詳細はコンソールを確認してください。";
+});
+
 function setAudio(f) {
   if (!f) return;
   source = f; sourceDuration = null; validated = null;
@@ -23,19 +30,15 @@ function setAudio(f) {
   $("compareCard").hidden = false;
   $("output").hidden = true;
 }
-$("drop").ondragover = e => e.preventDefault();
-$("drop").ondrop = e => { e.preventDefault(); setAudio(e.dataTransfer.files[0]); };
-$("bgm").onchange = e => { bgm = e.target.files[0] || null; $("bgmName").textContent = bgm ? `選択中：${bgm.name}` : "BGM未選択"; };
 
 // === AudioContext で音声をデコードし、モノラル・16kHzのFloat32Arrayを生成 ===
 async function decodeAudioToMono16k(file) {
-  progress(3, "音声をデコード中…", "ブラウザのAudio APIを使用");
+  progress(3, "音声をデコード中…", "ラウザのAudio APIを使用");
   const ctx = new (window.AudioContext || window.webkitAudioContext)();
   const arrayBuffer = await file.arrayBuffer();
   const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
   ctx.close();
 
-  // モノラル化
   const channels = audioBuffer.numberOfChannels;
   const length = audioBuffer.length;
   const mono = new Float32Array(length);
@@ -45,7 +48,6 @@ async function decodeAudioToMono16k(file) {
     mono[i] = sum / channels;
   }
 
-  // 16kHz リサンプリング（簡易線形補間）
   const srcRate = audioBuffer.sampleRate;
   const targetRate = 16000;
   if (srcRate === targetRate) return mono;
@@ -64,11 +66,16 @@ async function decodeAudioToMono16k(file) {
   return resampled;
 }
 
-// === Worker による文字起こし ===
+// === Worker による文字起し ===
 function startTranscriptionWorker(audioData, model, language) {
   return new Promise((resolve, reject) => {
     if (worker) { worker.terminate(); worker = null; }
-    worker = new Worker("./transcribe-worker.js", { type: "module" });
+    try {
+      worker = new Worker("./transcribe-worker.js", { type: "module" });
+    } catch (err) {
+      reject(new Error("Web Worker の作成に失敗しました。ブラウザが module Worker に対応していない可能性があります。" + err.message));
+      return;
+    }
 
     worker.onmessage = e => {
       const d = e.data;
@@ -90,42 +97,72 @@ function startTranscriptionWorker(audioData, model, language) {
 
     worker.onerror = err => {
       worker.terminate(); worker = null;
-      reject(err);
+      reject(new Error("Worker エラー: " + err.message));
     };
 
     worker.postMessage({ type: "transcribe", audio: audioData, model, language });
   });
 }
 
-$("transcribe").onclick = async () => {
-  $("transcribe").disabled = true;
-  try {
-    progress(1, "音声を準備中…");
-    const pcm = await decodeAudioToMono16k(source);
-    progress(5, "文字起こしエンジンを起動中…");
-    segments = await startTranscriptionWorker(pcm, $("model").value, $("language").value);
-    $("transcript").value = segments.map(s => `[${fmt(s.start)} - ${fmt(s.end)}] ${s.text}`).join("\n");
-    $("transcriptCard").hidden = false;
-    $("transcriptCard").scrollIntoView({ behavior: "smooth" });
-    progress(100, "文字起こし完了");
-  } catch (e) {
-    alert("文字起こしに失敗しました: " + (e?.message || String(e)));
-    progress(0, "エラー", e?.message || String(e));
-  } finally {
-    $("transcribe").disabled = false;
-  }
-};
+// === DOMContentLoaded 後にイベントリスナーを設定 ===
+document.addEventListener("DOMContentLoaded", () => {
+  $("audio").onchange = e => setAudio(e.target.files[0]);
+  $("drop").ondragover = e => e.preventDefault();
+  $("drop").ondrop = e => { e.preventDefault(); setAudio(e.dataTransfer.files[0]); };
+  $("bgm").onchange = e => { bgm = e.target.files[0] || null; $("bgmName").textContent = bgm ? `選択中：${bgm.name}` : "BGM未選択"; };
+
+  $("transcribe").onclick = async () => {
+    if (!source) { alert("音声ファイルを選択しください。"); return; }
+    $("transcribe").disabled = true;
+    try {
+      progress(1, "音声を準備中…");
+      const pcm = await decodeAudioToMono16k(source);
+      progress(5, "文字起こしエンジンを起動中…");
+      segments = await startTranscriptionWorker(pcm, $("model").value, $("language").value);
+      $("transcript").value = segments.map(s => `[${fmt(s.start)} - ${fmt(s.end)}] ${s.text}`).join("\n");
+      $("transcriptCard").hidden = false;
+      $("transcriptCard").scrollIntoView({ behavior: "smooth" });
+      progress(100, "文字起こし完了");
+    } catch (e) {
+      alert("文字起こしに失敗しました: " + (e?.message || String(e)));
+      progress(0, "エラー", e?.message || String(e));
+    } finally {
+      $("transcribe").disabled = false;
+    }
+  };
+
+  $("copyPrompt").onclick = async () => {
+    try { await navigator.clipboard.writeText(promptText()); $("copyPrompt").textContent = "コピーしました"; }
+    catch { $("transcript").value = promptText(); alert("コピーできないため、文字起こし欄に依頼文を表示しました。"); }
+  };
+  $("downloadTranscript").onclick = () => dl($("transcript").value, "transcript.txt", "text/plain;charset=utf-8");
+  $("downloadTranscriptJson").onclick = () => dl(JSON.stringify(transcriptObject(), null, 2), "transcript.json", "application/json");
+  $("jsonFile").onchange = async e => { const f = e.target.files[0]; if (f) $("instructions").value = await f.text(); };
+  $("sample").onclick = () => { $("instructions").value = JSON.stringify({ version: 1, operations: [{ type: "cut", start: 10, end: 13, reason: "サンプルのカット" }, { type: "bgm", start: 0, end: 45, track: "main", volume: 0.1 }, { type: "fade", start: 43, end: 45, effect: "out" }, { type: "marker", time: 45, label: "話題転換" }], notes: ["サンプル指示です。実際の音源に合わせて時刻を修正してください。"] }, null, 2); };
+  $("validate").onclick = validate;
+  $("execute").onclick = async () => {
+    if (!validated && !validate()) return;
+    $("execute").disabled = true;
+    try {
+      editProgress(2, "編集エンジンを準備中…"); const blob = await render();
+      if (outputUrl) URL.revokeObjectURL(outputUrl); outputUrl = URL.createObjectURL(blob);
+      $("preview").src = outputUrl; $("save").href = outputUrl; $("save").download = "podcast_final." + $("format").value;
+      $("output").hidden = false; $("editedDuration").textContent = `完成音源 · ${(blob.size / 1048576).toFixed(1)} MB`;
+      $("compareCard").hidden = false; editProgress(100, "編集完了"); $("output").scrollIntoView({ behavior: "smooth", block: "nearest" });
+    } catch (e) {
+      editProgress(0, "編集できませんでした: " + (e?.message || String(e)));
+      let errorBox = $("editError");
+      if (!errorBox) { errorBox = document.createElement("pre"); errorBox.id = "editError"; errorBox.className = "validation err"; $("editProgressBox").after(errorBox); }
+      errorBox.textContent = e?.stack || e?.message || String(e);
+    } finally { $("execute").disabled = false; }
+  };
+});
 
 function transcriptObject() { return { version: 1, language: $("language").value, source_file: source?.name, segments }; }
 function promptText() {
-  return `あなたはポッドキャストの編集ディレクターです。以下のタイムスタンプ付き文字起こしを読み、編集指示JSONを作成してください。\n\n方針:\n- 会話の意味を損なわない。発言の途中を切らない。\n- 不要な長い沈黙、明確な言い直し、重複だけを慎重に候補化する。\n- 話題転換には必要に応じてジングルを置く。\n- BGMは会話を邪魔しない音量にする。\n- 不確かな編集は実行せず、notesに理由を書く。\n\n出力は説明文やMarkdown囲みなしのJSONのみ。形式:\n{\"version\":1,\"operations\":[{\"type\":\"cut\",\"start\":12.5,\"end\":18.2,\"reason\":\"理由\"},{\"type\":\"bgm\",\"start\":0,\"end\":60,\"track\":\"main\",\"volume\":0.12,\"fade_in\":2,\"fade_out\":3},{\"type\":\"fade\",\"start\":58,\"end\":60,\"effect\":\"out\"},{\"type\":\"marker\",\"time\":120,\"label\":\"話題転換\"}],\"notes\":[\"確認事項\"]}\n\n利用可能な操作:\n- cut: start/end秒。音源から区間を削除\n- bgm: start/end秒、trackは\"main\"、volumeは0〜1、fade_in/fade_outは任意の秒数。BGMは指定区間だけ再生し、カットされた区間では元音源時間に沿って進める\n- fade: start/end秒、effectは\"in\"または\"out\"。指定範囲で音量をフェード\n- marker: time秒、label文字列（編集目印のみ）\n\n時刻はすべて元音源上の秒数です。音源の長さを超えないでください。カット区間を重複させないください。\n\n文字起こし:\n${$("transcript").value}`;
+  return `あなたはポッドキャストの編集ディレクターです。以下のタイムスタンプ付き文字起こしを読み、編集指示JSONを作成してください。\n\n方針:\n- 会話の意味を損なわない。発言の途中を切らない。\n- 不要な長い沈黙、明確な言い直し、重複だけを慎重に候補化する。\n- 話題転換には必要に応じてジングルを置く。\n- BGMは会話を邪魔しない音量にする。\n- 不確かな編集は実行せず、notesに理由を書く。\n\n出力は説明文やMarkdown囲みなしのJSONのみ。形式:\n{"version":1,"operations":[{"type":"cut","start":12.5,"end":18.2,"reason":"理由"},{"type":"bgm","start":0,"end":60,"track":"main","volume":0.12,"fade_in":2,"fade_out":3},{"type":"fade","start":58,"end":60,"effect":"out"},{"type":"marker","time":120,"label":"話題転換"}],"notes":["確認事項"]}\n\n利用可能な操作:\n- cut: start/end秒。音源から区間を削除\n- bgm: start/end秒、trackは"main"、volumeは0〜1、fade_in/fade_outは任意の秒数。BGMは指定区間だけ再生し、カットされた区間では元音源時間に沿って進める\n- fade: start/end秒、effectは"in"または"out"。指定範囲で音量をフェード\n- marker: time秒、label文字列（編集目印のみ）\n\n時刻はすべて元音源上の秒数です。音源の長さを超えないでください。カット区間を重複させないください。\n\n文字起こし:\n${$("transcript").value}`;
 }
-$("copyPrompt").onclick = async () => { try { await navigator.clipboard.writeText(promptText()); $("copyPrompt").textContent = "コピーしました"; } catch { $("transcript").value = promptText(); alert("コピーできないため、文字起こし欄に依頼文を表示しました。"); } };
 function dl(text, name, type) { const u = URL.createObjectURL(new Blob([text], { type })), a = document.createElement("a"); a.href = u; a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(u), 1000); }
-$("downloadTranscript").onclick = () => dl($("transcript").value, "transcript.txt", "text/plain;charset=utf-8");
-$("downloadTranscriptJson").onclick = () => dl(JSON.stringify(transcriptObject(), null, 2), "transcript.json", "application/json");
-$("jsonFile").onchange = async e => { const f = e.target.files[0]; if (f) $("instructions").value = await f.text(); };
-$("sample").onclick = () => { $("instructions").value = JSON.stringify({ version: 1, operations: [{ type: "cut", start: 10, end: 13, reason: "サンプルのカット" }, { type: "bgm", start: 0, end: 45, track: "main", volume: 0.1 }, { type: "fade", start: 43, end: 45, effect: "out" }, { type: "marker", time: 45, label: "話題転換" }], notes: ["サンプル指示です。実際の音源に合わせて時刻を修正してください。"] }, null, 2); };
 
 function parseInstructions() {
   const obj = JSON.parse($("instructions").value);
@@ -150,7 +187,6 @@ function validate() {
     $("validation").className = "validation ok"; $("validation").textContent = `検証OK：${validated.operations.length}件の操作。時刻は元音源基準です。`; renderOps(); renderTimeline(); $("editCard").hidden = false; return true;
   } catch (e) { validated = null; $("validation").className = "validation err"; $("validation").textContent = "JSONエラー：" + e.message; $("editCard").hidden = true; return false; }
 }
-$("validate").onclick = validate;
 function renderOps() {
   const el = $("operationList"); el.innerHTML = "";
   validated.operations.forEach(o => {
@@ -225,7 +261,7 @@ async function render() {
   for (let i = 1; i < cuts.length; i++) if (cuts[i].start < cuts[i - 1].end) throw Error("カット区間が重複しています。");
   const keep = []; let cur = 0;
   cuts.forEach(c => { if (c.start > cur) keep.push([cur, c.start]); cur = c.end; }); if (cur < duration) keep.push([cur, duration]);
-  if (!keep.length) throw Error("音声全体がカットされていま。");
+  if (!keep.length) throw Error("音声全体がカットされています。");
   const f = await loadFF();
   const ext = (source.name.split(".").pop() || "wav").toLowerCase().replace(/[^a-z0-9]/g, "");
   await f.writeFile("source." + ext, await fetchFile(source));
@@ -266,19 +302,3 @@ async function render() {
   if (format === "mp3") args.push("-c:a", "libmp3lame", "-b:a", "192k", out); else args.push("-c:a", "pcm_s16le", out);
   await f.exec(args); const data = await f.readFile(out); return new Blob([data.buffer], { type: format === "mp3" ? "audio/mpeg" : "audio/wav" });
 }
-$("execute").onclick = async () => {
-  if (!validated && !validate()) return;
-  $("execute").disabled = true;
-  try {
-    editProgress(2, "編集エンジンを準備中…"); const blob = await render();
-    if (outputUrl) URL.revokeObjectURL(outputUrl); outputUrl = URL.createObjectURL(blob);
-    $("preview").src = outputUrl; $("save").href = outputUrl; $("save").download = "podcast_final." + $("format").value;
-    $("output").hidden = false; $("editedDuration").textContent = `完成音源 · ${(blob.size / 1048576).toFixed(1)} MB`;
-    $("compareCard").hidden = false; editProgress(100, "編集完了"); $("output").scrollIntoView({ behavior: "smooth", block: "nearest" });
-  } catch (e) {
-    editProgress(0, "編集できませんでした: " + (e?.message || String(e)));
-    let errorBox = $("editError");
-    if (!errorBox) { errorBox = document.createElement("pre"); errorBox.id = "editError"; errorBox.className = "validation err"; $("editProgressBox").after(errorBox); }
-    errorBox.textContent = e?.stack || e?.message || String(e);
-  } finally { $("execute").disabled = false; }
-};
