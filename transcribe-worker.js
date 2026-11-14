@@ -20,7 +20,7 @@ function collapseRepetitions(segments) {
   let repeatCount = 0;
 
   for (const seg of segments) {
-    let text = (seg.text || "").trim().replace(/(.{3,25}?)\1{3,}/g, "$1$1");
+    let text = (seg.text || "").trim().replace(/(.{3,25}?){3,}/g, "$1$1");
     if (!text) continue;
 
     const norm = text.replace(/[\s、。！？,.!?]/g, "");
