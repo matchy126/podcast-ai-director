@@ -27,46 +27,97 @@ $("bgm").onchange = e => { bgm = e.target.files[0] || null; $("bgmName").textCon
 
 let transcriptionWorker = null;
 let workerBusy = false;
-function finishWorkerTask() { workerBusy = false; $("transcribe").disabled = false; }
+
 function getTranscriptionWorker() {
   if (transcriptionWorker) return transcriptionWorker;
   transcriptionWorker = new Worker(new URL("./transcribe-worker.js", import.meta.url), { type: "module" });
-  transcriptionWorker.onmessage = ({ data: msg }) => {
+  transcriptionWorker.onmessage = event => {
+    const msg = event.data || {};
     if (msg.type === "progress") {
-      const pct = Number.isFinite(msg.percent) ? Math.round(Math.max(3, Math.min(48, msg.percent * 0.48))) : 12;
-      progress(pct, msg.label || "AIモデルをダウンロード中…", msg.detail || "");
+      const pct = Number.isFinite(msg.percent) ? Math.round(3 + msg.percent * 0.45) : 8;
+      progress(Math.min(48, pct), msg.label || "AIモデルをダウンロード中…", msg.detail || "");
     } else if (msg.type === "status") {
-      const states = {
+      const stages = {
         initializing: [52, "モデルを初期化中…"],
         transcribing: [62, "音声を解析中…"]
       };
-      const state = states[msg.stage] || [50, msg.label || "処理中…"];
-      progress(state[0], state[1], msg.detail || "処理には数分かかる場合があります。");
+      const stage = stages[msg.stage] || [50, "処理中…"];
+      progress(stage[0], stage[1], msg.detail || "処理には時間がかかる場合があります。");
     } else if (msg.type === "result") {
       segments = msg.segments || [];
       $("transcript").value = segments.map(s => `[${fmt(s.start)} - ${fmt(s.end)}] ${s.text}`).join("\n");
       $("transcriptCard").hidden = false;
       $("transcriptCard").scrollIntoView({ behavior: "smooth" });
       progress(100, "文字起こし完了", `${segments.length}個の発話区間`);
-      finishWorkerTask();
+      finishTranscription();
     } else if (msg.type === "error") {
       progress(0, "文字起こしに失敗しました", msg.message || "不明なエラー");
-      alert("文字起こしに失敗しました:\n" + (msg.message || "不明なエラー"));
-      finishWorkerTask();
+      finishTranscription();
     }
   };
-  transcriptionWorker.onerror = (event) => {
+  transcriptionWorker.onerror = event => {
     progress(0, "文字起こしワーカーでエラー", event.message || "Worker error");
-    alert("文字起こし処理でエラーが発生しました。ページを再読み込みして再試行してください。");
-    finishWorkerTask(); transcriptionWorker?.terminate(); transcriptionWorker = null;
+    finishTranscription();
+    transcriptionWorker?.terminate();
+    transcriptionWorker = null;
   };
   return transcriptionWorker;
 }
-function transcribe() {
+
+function finishTranscription() {
+  workerBusy = false;
+  $("transcribe").disabled = false;
+}
+
+async function decodeAndResample(file, targetRate = 16000) {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) throw new Error("このブラウザはAudioContextに対応していません。ChromeまたはEdgeを使用してください。");
+  const context = new AudioContextClass();
+  try {
+    const buffer = await context.decodeAudioData(await file.arrayBuffer());
+    const channels = [];
+    for (let c = 0; c < buffer.numberOfChannels; c++) channels.push(buffer.getChannelData(c));
+    const mono = new Float32Array(buffer.length);
+    for (let i = 0; i < buffer.length; i++) {
+      let sum = 0;
+      for (let c = 0; c < channels.length; c++) sum += channels[c][i];
+      mono[i] = sum / channels.length;
+    }
+    if (buffer.sampleRate === targetRate) return mono;
+    const outputLength = Math.ceil(mono.length * targetRate / buffer.sampleRate);
+    const output = new Float32Array(outputLength);
+    const ratio = buffer.sampleRate / targetRate;
+    for (let i = 0; i < outputLength; i++) {
+      const position = i * ratio;
+      const left = Math.floor(position);
+      const right = Math.min(left + 1, mono.length - 1);
+      const fraction = position - left;
+      output[i] = mono[left] * (1 - fraction) + mono[right] * fraction;
+    }
+    return output;
+  } finally {
+    await context.close();
+  }
+}
+
+async function transcribe() {
   if (!source || workerBusy) return;
-  workerBusy = true; $("transcribe").disabled = true;
-  progress(2, "文字起こしを準備中…", "画面とは別のスレッドで処理します。");
-  getTranscriptionWorker().postMessage({ type: "transcribe", file: source, model: $("model").value, language: $("language").value });
+  workerBusy = true;
+  $("transcribe").disabled = true;
+  try {
+    progress(2, "音声を読み込み中…", "ブラウザで音声をPCMデータに変換しています。");
+    const pcm = await decodeAndResample(source, 16000);
+    progress(3, "AIモデルを準備中…", "音声をWorkerへ渡しています。");
+    getTranscriptionWorker().postMessage({
+      type: "transcribe",
+      audio: pcm.buffer,
+      model: $("model").value,
+      language: $("language").value
+    }, [pcm.buffer]);
+  } catch (error) {
+    progress(0, "音声の読み込みに失敗しました", error?.stack || error?.message || String(error));
+    finishTranscription();
+  }
 }
 $("transcribe").onclick = () => transcribe();
 
