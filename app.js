@@ -78,14 +78,11 @@ function encodeWavFast(samples, sampleRate) {
 function cleanTranscript(text) {
   if (!text) return "";
   let s = text;
-  s = s.replace(/(\S){9,}/g, "$1");
-  s = s.replace(/(\S{2,4})(?:\s*){4,}/g, "$1");
-  s = s.replace(/(\S+)(?:\s+){2,}/g, "$1 $1");
-  s = s.replace(/([。、]){9,}/g, "$1");
-  s = s.replace(/
-{3,}/g, "
-
-");
+  s = s.replace(/(\S)\1{9,}/g, "$1");
+  s = s.replace(/(\S{2,4})(?:\s*\1){4,}/g, "$1");
+  s = s.replace(/\b(\S+)(?:\s+\1){2,}\b/g, "$1 $1");
+  s = s.replace(/([。、])\1{9,}/g, "$1");
+  s = s.replace(/\n{3,}/g, "\n\n");
   return s.trim();
 }
 
@@ -141,8 +138,7 @@ function renderTranscriptUI() {
   const textarea = $("transcript");
   if (!container || !textarea) return;
   container.innerHTML = "";
-  textarea.value = segments.map(s => `[${fmt(s.start)} - ${fmt(s.end)}] ${s.speaker !== "unknown" ? "[" + s.speaker + "] " : ""}${s.text}`).join("
-");
+  textarea.value = segments.map(s => `[${fmt(s.start)} - ${fmt(s.end)}] ${s.speaker !== "unknown" ? "[" + s.speaker + "] " : ""}${s.text}`).join("\n");
 
   segments.forEach((seg, idx) => {
     const row = document.createElement("div");
@@ -196,30 +192,8 @@ function transcriptObject() {
 }
 
 function promptText() {
-  const speakerLines = segments.map(s => `[${fmt(s.start)} - ${fmt(s.end)}] ${s.speaker !== "unknown" ? "[" + s.speaker + "] " : ""}${s.text}`).join("
-");
-  return `あなたはポッドキャストの編集ディレクターです。以下のタイムスタンプ付き文字起こしを読み、編集指示JSONを作成してください。
-
-方針:
-- 会話の意味を損なわない。発言の途中を切らない。
-- 不要な長い沈黙、明確な言い直し、重複だけを慎重に候補化する。
-- 話題転換には必要に応じてジングルを置く。
-- BGMは会話を邪魔しない音量にする。
-- 不確かな編集は実行せず、notesに理由を書く。
-
-出力は説明文やMarkdown囲みなしのJSONのみ。形式:
-{"version":1,"operations":[{"type":"cut","start":12.5,"end":18.2,"reason":"理由"},{"type":"bgm","start":0,"end":60,"track":"main","volume":0.12,"fade_in":2,"fade_out":3},{"type":"fade","start":58,"end":60,"effect":"out"},{"type":"marker","time":120,"label":"話題転換"}],"notes":["確認事項"]}
-
-利用可能な操作:
-- cut: start/end秒。音源から区間を削除
-- bgm: start/end秒、trackは"main"、volumeは0〜1、fade_in/fade_outは任意の秒数。BGMは指定区間だけ再生し、カットされた区間では元音源時間に沿って進める
-- fade: start/end秒、effectは"in"または"out"。指定範囲で音量をフェード
-- marker: time秒、label文字列（編集目印のみ）
-
-時刻はすべて元音源上の秒数です。音源の長さを超えないでください。カット区間を重複させないでください。
-
-文字起こし:
-${speakerLines}`;
+  const speakerLines = segments.map(s => `[${fmt(s.start)} - ${fmt(s.end)}] ${s.speaker !== "unknown" ? "[" + s.speaker + "] " : ""}${s.text}`).join("\n");
+  return `あなたはポッドキャストの編集ディレクターです。以下のタイムスタンプ付き文字起こしを読み、編集指示JSONを作成してください。\n\n方針:\n- 会話の意味を損なわない。発言の途中を切らない。\n- 不要な長い沈黙、明確な言い直し、重複だけを慎重に候補化する。\n- 話題転換には必要に応じてジングルを置く。\n- BGMは会話を邪魔しない音量にする。\n- 不確かな編集は実行せず、notesに理由を書く。\n\n出力は説明文やMarkdown囲みなしのJSONのみ。形式:\n{"version":1,"operations":[{"type":"cut","start":12.5,"end":18.2,"reason":"理由"},{"type":"bgm","start":0,"end":60,"track":"main","volume":0.12,"fade_in":2,"fade_out":3},{"type":"fade","start":58,"end":60,"effect":"out"},{"type":"marker","time":120,"label":"話題転換"}],"notes":["確認事項"]}\n\n利用可能な操作:\n- cut: start/end秒。音源から区間を削除\n- bgm: start/end秒、trackは"main"、volumeは0〜1、fade_in/fade_outは任意の秒数。BGMは指定区間だけ再生し、カットされた区間では元音源時間に沿って進める\n- fade: start/end秒、effectは"in"または"out"。指定範囲で音量をフェード\n- marker: time秒、label文字列（編集目印のみ）\n\n時刻はすべて元音源上の秒数です。音源の長さを超えないでください。カット区間を重複させないでください。\n\n文字起こし:\n${speakerLines}`;
 }
 
 $("copyPrompt").onclick = async () => { try { await navigator.clipboard.writeText(promptText()); $("copyPrompt").textContent = "コピーしました"; } catch { $("transcript").value = promptText(); alert("コピーできないため、文字起こし欄に依頼を表示しました。"); } };
@@ -237,7 +211,7 @@ function parseInstructions() {
     if (o.type === "marker") { if (!Number.isFinite(o.time) || o.time < 0) throw Error(`操作${i + 1}: timeが不正です`); return o; }
     if (!Number.isFinite(o.start) || !Number.isFinite(o.end) || o.start < 0 || o.end <= o.start) throw Error(`操作${i + 1}: start/endが不正です`);
     if (o.type === "bgm" && (!Number.isFinite(o.volume) || o.volume < 0 || o.volume > 1 || (o.track && o.track !== "main"))) throw Error(`操作${i + 1}: BGMのtrackまたはvolumeが不正です`);
-    if (o.type === "bgm" && ((o.fade_in != null && (!Number.isFinite(o.fade_in) || o.fade_in < 0)) || (o.fade_out != null && (!Number.isFinite(o.fade_out) || o.fade_out < 0)))) throw Error(`操作${i + 1}: fade_in/fade_outは0以上の秒数す`);
+    if (o.type === "bgm" && ((o.fade_in != null && (!Number.isFinite(o.fade_in) || o.fade_in < 0)) || (o.fade_out != null && (!Number.isFinite(o.fade_out) || o.fade_out < 0)))) throw Error(`操作${i + 1}: fade_in/fade_outは0以上の秒数です`);
     if (o.type === "fade" && !["in", "out"].includes(o.effect)) throw Error(`操作${i + 1}: effectはin/outです`);
     return o;
   });
