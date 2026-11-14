@@ -62,9 +62,10 @@ async function getASR(modelKey) {
 
     self.postMessage({
       type: "status",
+      phase: "model-init",
       percent: 10,
       text: `AIモデル情報を取得中（${modelId}）…`,
-      detail: "初回はモデルのダウンロードに時間がかかります"
+      detail: "初回はモデルとWASMエンジンのダウンロードに時間がかかります"
     });
 
     const instance = await pipeline("automatic-speech-recognition", modelId, {
@@ -106,6 +107,7 @@ async function getASR(modelKey) {
 
           self.postMessage({
             type: "model-progress",
+            phase: "downloading",
             percent,
             text: "AIモデルをダウンロード中…",
             detail: `${fileName}${sizeInfo}`
@@ -114,18 +116,23 @@ async function getASR(modelKey) {
           const prev = fileStats.get(fileName) || { loaded: 0, total: 0, done: true };
           fileStats.set(fileName, { ...prev, done: true });
 
-          const allDone = fileStats.size > 0 && Array.from(fileStats.values()).every((v) => v.done);
+          const entries = Array.from(fileStats.entries());
+          const hasOnnx = entries.some(([name]) => name.endsWith(".onnx"));
+          const allDone = hasOnnx && entries.every(([, v]) => v.done);
+
           if (allDone && !compilingNotified) {
             compilingNotified = true;
             self.postMessage({
               type: "status",
-              percent: 47,
-              text: "ONNXモデルをコンパイル・初期化中…",
-              detail: "完了直前の準備中です（初回は10〜30秒ほどかかります）"
+              phase: "compiling",
+              percent: 48,
+              text: "ONNX推論エンジンを初期化・コンパイル中…",
+              detail: "モデル取得完了。WASMの展開に初回15〜40秒ほどかかります（処理継続中）"
             });
           } else {
             self.postMessage({
               type: "status",
+              phase: "downloading",
               percent: 46,
               text: "モデルファイルを展開中…",
               detail: `${fileName} 読み込み完了`
@@ -134,6 +141,7 @@ async function getASR(modelKey) {
         } else if (p.status === "ready") {
           self.postMessage({
             type: "status",
+            phase: "ready",
             percent: 50,
             text: "モデル準備完了。音声の解析を開始します…",
             detail: ""
@@ -173,6 +181,7 @@ self.onmessage = async (event) => {
 
     self.postMessage({
       type: "status",
+      phase: "inferring",
       percent: 50,
       text: `音声を文字起こし中…（約${estimatedChunks}ブロック）`,
       detail: `音声長: ${durationSeconds.toFixed(1)}秒 · 30秒窓 / 5秒オーバーラップ解析`
@@ -192,6 +201,7 @@ self.onmessage = async (event) => {
         const percent = 50 + Math.round(ratio * 45);
         self.postMessage({
           type: "infer-progress",
+          phase: "inferring",
           percent,
           text: `音声を文字起こし中…（${Math.min(processedChunks, estimatedChunks)}/${estimatedChunks} ブロック）`,
           detail: "重なり区間を統合して精度を調整しています"
@@ -201,6 +211,7 @@ self.onmessage = async (event) => {
 
     self.postMessage({
       type: "status",
+      phase: "postprocess",
       percent: 97,
       text: "タイムスタンプと文章を整形中…",
       detail: ""
