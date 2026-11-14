@@ -652,7 +652,6 @@ footer {
   color: var(--muted);
 }
 
-/* Future speaker-tagging UI support */
 .transcript-container {
   max-height: 400px;
   overflow-y: auto;

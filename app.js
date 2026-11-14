@@ -137,7 +137,7 @@ async function decodeAudioTo16kMono(file) {
 
 function getWorker() {
   if (!activeWorker) {
-    activeWorker = new Worker("./transcribe-worker.js?v=0.6.2", { type: "module" });
+    activeWorker = new Worker("./transcribe-worker.js?v=0.6.3", { type: "module" });
   }
   return activeWorker;
 }
@@ -180,7 +180,8 @@ async function transcribe() {
     worker.onerror = (err) => {
       cleanup();
       resetWorker();
-      const loc = err?.filename ? ` (${err.filename}:${err.lineno || 0})` : ""; reject(new Error((err?.message || "Web Worker の読み込みまたは実行に失敗しました。") + loc));
+      const loc = err?.filename ? ` (${err.filename}:${err.lineno || 0})` : "";
+      reject(new Error((err?.message || "Web Worker の読み込みまたは実行に失敗しました。") + loc));
     };
 
     worker.postMessage(
@@ -282,7 +283,6 @@ $("sample").onclick = () => {
 function parseInstructions() {
   const raw = $("instructions").value.trim();
   if (!raw) throw Error("編集指示JSONが入力されていません。");
-  // Strip accidental markdown code fences if pasted directly from an LLM
   const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
   const obj = JSON.parse(cleaned);
   if (obj.version !== 1 || !Array.isArray(obj.operations)) {
@@ -433,12 +433,13 @@ async function loadFF() {
       editProgress(45 + Math.round(ratio * 45), "音声をレンダリング中…", `${Math.round(ratio * 100)}%`);
     });
     const base = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd";
+    const classWorkerURL = new URL("./ffmpeg-worker.js?v=0.6.3", window.location.href).href;
     editProgress(8, "FFmpegコアをダウンロード中…", "初回のみエンジンを取得します");
     const coreURL = await toBlobURL(base + "/ffmpeg-core.js", "text/javascript");
     editProgress(22, "FFmpeg WASMをダウンロード中…", "ffmpeg-core.wasm");
     const wasmURL = await toBlobURL(base + "/ffmpeg-core.wasm", "application/wasm");
     editProgress(35, "FFmpegエンジンを初期化中…", "");
-    await instance.load({ coreURL, wasmURL });
+    await instance.load({ classWorkerURL, coreURL, wasmURL });
     if (!instance.loaded) {
       throw new Error("FFmpegの初期化が完了しませんでした。");
     }
