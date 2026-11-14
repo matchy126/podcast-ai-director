@@ -15,6 +15,19 @@ let sourceUrl = null;
 let activeWorker = null;
 let elapsedTimer = null;
 
+function formatError(err) {
+  if (!err) return "不明なエラーが発生しました。";
+  if (typeof err === "string") return err;
+  if (err.message) return err.message;
+  if (err.error?.message) return err.error.message;
+  if (err.type === "error") return "編集エンジンワーカーの読み込みに失敗しました。ページを再読み込みしてお試しください。";
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
+}
+
 const fmt = (s) => {
   const safe = Math.max(0, Number(s) || 0);
   const m = Math.floor(safe / 60);
@@ -137,7 +150,7 @@ async function decodeAudioTo16kMono(file) {
 
 function getWorker() {
   if (!activeWorker) {
-    activeWorker = new Worker("./transcribe-worker.js?v=0.6.3", { type: "module" });
+    activeWorker = new Worker("./transcribe-worker.js?v=0.6.4", { type: "module" });
   }
   return activeWorker;
 }
@@ -219,8 +232,9 @@ $("transcribe").onclick = async () => {
     setActiveStep(2);
     $("transcriptCard").scrollIntoView({ behavior: "smooth" });
   } catch (e) {
-    progress(0, "エラー", e.message);
-    alert("文字起こしに失敗しました: " + e.message);
+    const msg = formatError(e);
+    progress(0, "エラー", msg);
+    alert("文字起こしに失敗しました: " + msg);
   } finally {
     stopElapsedTimer();
     $("cancelTranscribe").hidden = true;
@@ -328,8 +342,10 @@ function validate() {
         }
       }
     }
+    const hasBgm = validated.operations.some((o) => o.type === "bgm");
+    const bgmNote = hasBgm && !bgm ? "（BGM指示あり：STEP 04でBGMファイルを選択してください）" : "";
     $("validation").className = "validation ok";
-    $("validation").textContent = `検証OK：${validated.operations.length}件の操作。時刻は元音源基準です。`;
+    $("validation").textContent = `検証OK：${validated.operations.length}件の操作。時刻は元音源基準です。${bgmNote}`;
     renderOps();
     renderTimeline();
     $("editCard").hidden = false;
@@ -338,7 +354,7 @@ function validate() {
   } catch (e) {
     validated = null;
     $("validation").className = "validation err";
-    $("validation").textContent = "JSONエラー：" + e.message;
+    $("validation").textContent = "JSONエラー：" + formatError(e);
     $("editCard").hidden = true;
     return false;
   }
@@ -432,14 +448,16 @@ async function loadFF() {
       const ratio = Number.isFinite(p) ? Math.min(1, Math.max(0, p)) : 0;
       editProgress(45 + Math.round(ratio * 45), "音声をレンダリング中…", `${Math.round(ratio * 100)}%`);
     });
-    const base = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd";
-    const classWorkerURL = new URL("./ffmpeg-worker.js?v=0.6.3", window.location.href).href;
+    const base = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm";
+    const workerCode = 'import "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/worker.js";';
+    const classWorkerURL = URL.createObjectURL(new Blob([workerCode], { type: "text/javascript" }));
     editProgress(8, "FFmpegコアをダウンロード中…", "初回のみエンジンを取得します");
     const coreURL = await toBlobURL(base + "/ffmpeg-core.js", "text/javascript");
     editProgress(22, "FFmpeg WASMをダウンロード中…", "ffmpeg-core.wasm");
     const wasmURL = await toBlobURL(base + "/ffmpeg-core.wasm", "application/wasm");
     editProgress(35, "FFmpegエンジンを初期化中…", "");
     await instance.load({ classWorkerURL, coreURL, wasmURL });
+    URL.revokeObjectURL(classWorkerURL);
     if (!instance.loaded) {
       throw new Error("FFmpegの初期化が完了しませんでした。");
     }
@@ -452,7 +470,7 @@ async function loadFF() {
   } catch (err) {
     ff = null;
     ffLoadPromise = null;
-    throw err;
+    throw new Error(formatError(err));
   }
 }
 
@@ -591,6 +609,8 @@ async function render() {
     editProgress(94, "出力ファイルを生成中…");
     const data = await f.readFile(outName);
     return new Blob([data.buffer], { type: format === "mp3" ? "audio/mpeg" : "audio/wav" });
+  } catch (err) {
+    throw new Error(formatError(err));
   } finally {
     for (const fileName of tempFiles) {
       try {
@@ -619,8 +639,9 @@ $("execute").onclick = async () => {
     editProgress(100, "編集完了");
     $("output").scrollIntoView({ behavior: "smooth", block: "nearest" });
   } catch (e) {
-    editProgress(0, "エラー", e.message);
-    alert("編集できませんでした: " + e.message);
+    const msg = formatError(e);
+    editProgress(0, "エラー", msg);
+    alert("編集できませんでした: " + msg);
   } finally {
     $("execute").disabled = false;
   }
