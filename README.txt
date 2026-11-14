@@ -1,13 +1,15 @@
-Podcast AI Director - FFmpeg load fix
+Podcast AI Director v0.6
 
-Replace the app.js in your GitHub Pages repository with this file.
-Keep index.html and style.css unchanged.
+Changes from v0.5:
+1. app.js now uses Web Worker for transcription (fixes UI freeze)
+2. AudioContext decoding implemented (mono + 16kHz resampling)
+3. Worker uses Whisper standard chunk_length_s=30, stride_length_s=5
+4. FFmpeg load fix retained from v0.5
 
-Fixes:
-- FFmpeg instance is cached only after a successful load.
-- A failed FFmpeg load clears the instance so retry does not skip ff.load().
-- Concurrent load requests share one initialization promise.
-- FFmpeg loading and initialization stages are displayed.
-- Editing errors are shown in a selectable page area rather than only in a popup.
+Files:
+- index.html
+- style.css
+- app.js
+- transcribe-worker.js
 
-After committing, hard-refresh the deployed page (Ctrl+Shift+R). If the browser still serves an old module, clear the site's cached data or change the app.js URL/version query in index.html.
+Deploy to GitHub Pages by uploading these files to your repository.

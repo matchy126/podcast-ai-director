@@ -1,9 +1,10 @@
-import { pipeline, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.2";
 import { FFmpeg } from "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/index.js";
 import { fetchFile, toBlobURL } from "https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/dist/esm/index.js";
 
 const $ = id => document.getElementById(id);
 let source = null, segments = [], ff = null, validated = null, bgm = null, sourceDuration = null, outputUrl = null, sourceUrl = null;
+let worker = null;
+
 const fmt = s => { const m = Math.floor(s / 60), x = (s % 60).toFixed(1).padStart(4, "0"); return `${String(m).padStart(2, "0")}:${x}`; };
 function progress(p, t, d = "") { $("progressbox").hidden = false; $("progress").value = p; $("progressNum").textContent = p + "%"; $("progressText").textContent = t; $("progressDetail").textContent = d; }
 function editProgress(p, t) { $("editProgressBox").hidden = false; $("editProgress").value = p; $("editProgressNum").textContent = p + "%"; $("editProgressText").textContent = t; }
@@ -26,25 +27,98 @@ $("drop").ondragover = e => e.preventDefault();
 $("drop").ondrop = e => { e.preventDefault(); setAudio(e.dataTransfer.files[0]); };
 $("bgm").onchange = e => { bgm = e.target.files[0] || null; $("bgmName").textContent = bgm ? `選択中：${bgm.name}` : "BGM未選択"; };
 
-async function transcribe() {
-  const models = { tiny: "onnx-community/whisper-tiny", base: "onnx-community/whisper-base", small: "onnx-community/whisper-small" };
-  env.allowLocalModels = false;
-  const asr = await pipeline("automatic-speech-recognition", models[$("model").value], { dtype: "q8", progress_callback: p => { if (p.status === "progress") progress(5 + Math.round((p.progress || 0) * .45), "AIモデルをダウンロード中…", p.file || ""); } });
-  const url = URL.createObjectURL(source);
-  try {
-    const r = await asr(url, { language: $("language").value, task: "transcribe", chunk_length_s: 25, stride_length_s: 5, return_timestamps: true });
-    return (r.chunks || [{ timestamp: [0, null], text: r.text }]).map(c => ({ start: Number(c.timestamp?.[0] || 0), end: Number(c.timestamp?.[1] || 0), text: (c.text || "").trim() })).filter(x => x.text);
-  } finally { URL.revokeObjectURL(url); }
+// === AudioContext で音声をデコードし、モノラル・16kHzのFloat32Arrayを生成 ===
+async function decodeAudioToMono16k(file) {
+  progress(3, "音声をデコード中…", "ブラウザのAudio APIを使用");
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const arrayBuffer = await file.arrayBuffer();
+  const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+  ctx.close();
+
+  // モノラル化
+  const channels = audioBuffer.numberOfChannels;
+  const length = audioBuffer.length;
+  const mono = new Float32Array(length);
+  for (let i = 0; i < length; i++) {
+    let sum = 0;
+    for (let ch = 0; ch < channels; ch++) sum += audioBuffer.getChannelData(ch)[i];
+    mono[i] = sum / channels;
+  }
+
+  // 16kHz リサンプリング（簡易線形補間）
+  const srcRate = audioBuffer.sampleRate;
+  const targetRate = 16000;
+  if (srcRate === targetRate) return mono;
+
+  const ratio = srcRate / targetRate;
+  const newLength = Math.floor(length / ratio);
+  const resampled = new Float32Array(newLength);
+  for (let i = 0; i < newLength; i++) {
+    const pos = i * ratio;
+    const idx = Math.floor(pos);
+    const frac = pos - idx;
+    const a = mono[idx] || 0;
+    const b = mono[Math.min(idx + 1, length - 1)] || 0;
+    resampled[i] = a + (b - a) * frac;
+  }
+  return resampled;
 }
+
+// === Worker による文字起こし ===
+function startTranscriptionWorker(audioData, model, language) {
+  return new Promise((resolve, reject) => {
+    if (worker) { worker.terminate(); worker = null; }
+    worker = new Worker("./transcribe-worker.js", { type: "module" });
+
+    worker.onmessage = e => {
+      const d = e.data;
+      if (d.type === "model-progress" && Number.isFinite(d.percent)) {
+        progress(5 + Math.round(d.percent * 0.45), "AIモデルをダウンロード中…", d.detail || "");
+      } else if (d.type === "status") {
+        progress($("progress").value, d.text, $("progressDetail").textContent);
+      } else if (d.type === "chunk-progress") {
+        const cp = d.total > 0 ? Math.round((d.completed / d.total) * 35) : 0;
+        progress(50 + cp, `音声を解析中…（${d.completed}/${d.total} 区間）`, "");
+      } else if (d.type === "result") {
+        worker.terminate(); worker = null;
+        resolve(d.segments);
+      } else if (d.type === "error") {
+        worker.terminate(); worker = null;
+        reject(new Error(d.message));
+      }
+    };
+
+    worker.onerror = err => {
+      worker.terminate(); worker = null;
+      reject(err);
+    };
+
+    worker.postMessage({ type: "transcribe", audio: audioData, model, language });
+  });
+}
+
 $("transcribe").onclick = async () => {
   $("transcribe").disabled = true;
-  try { progress(2, "文字起こしを準備中…"); segments = await transcribe(); $("transcript").value = segments.map(s => `[${fmt(s.start)} - ${fmt(s.end)}] ${s.text}`).join("\n"); $("transcriptCard").hidden = false; $("transcriptCard").scrollIntoView({ behavior: "smooth" }); }
-  catch (e) { alert("文字起こしに失敗しました: " + e.message); progress(0, "エラー", e.message); }
-  finally { $("transcribe").disabled = false; }
+  try {
+    progress(1, "音声を準備中…");
+    const pcm = await decodeAudioToMono16k(source);
+    progress(5, "文字起こしエンジンを起動中…");
+    segments = await startTranscriptionWorker(pcm, $("model").value, $("language").value);
+    $("transcript").value = segments.map(s => `[${fmt(s.start)} - ${fmt(s.end)}] ${s.text}`).join("\n");
+    $("transcriptCard").hidden = false;
+    $("transcriptCard").scrollIntoView({ behavior: "smooth" });
+    progress(100, "文字起こし完了");
+  } catch (e) {
+    alert("文字起こしに失敗しました: " + (e?.message || String(e)));
+    progress(0, "エラー", e?.message || String(e));
+  } finally {
+    $("transcribe").disabled = false;
+  }
 };
+
 function transcriptObject() { return { version: 1, language: $("language").value, source_file: source?.name, segments }; }
 function promptText() {
-  return `あなたはポッドキャストの編集ディレクターです。以下のタイムスタンプ付き文字起こしを読み、編集指示JSONを作成してください。\n\n方針:\n- 会話の意味を損なわない。発言の途中を切らない。\n- 不要な長い沈黙、明確な言い直し、重複だけを慎重に候補化する。\n- 話題転換には必要に応じてジングルを置く。\n- BGMは会話を邪魔しない音量にする。\n- 不確かな編集は実行せず、notesに理由を書く。\n\n出力は説明文やMarkdown囲みなしのJSONのみ。形式:\n{"version":1,"operations":[{"type":"cut","start":12.5,"end":18.2,"reason":"理由"},{"type":"bgm","start":0,"end":60,"track":"main","volume":0.12,"fade_in":2,"fade_out":3},{"type":"fade","start":58,"end":60,"effect":"out"},{"type":"marker","time":120,"label":"話題転換"}],"notes":["確認事項"]}\n\n利用可能な操作:\n- cut: start/end秒。音源から区間を削除\n- bgm: start/end秒、trackは"main"、volumeは0〜1、fade_in/fade_outは任意の秒数。BGMは指定区間だけ再生し、カットされた区間では元音源時間に沿って進める\n- fade: start/end秒、effectは"in"または"out"。指定範囲で音量をフェード\n- marker: time秒、label文字列（編集目印のみ）\n\n時刻はすべて元音源上の秒数です。音源の長さを超えないでください。カット区間を重複させないでください。\n\n文字起こし:\n${$("transcript").value}`;
+  return `あなたはポッドキャストの編集ディレクターです。以下のタイムスタンプ付き文字起こしを読み、編集指示JSONを作成してください。\n\n方針:\n- 会話の意味を損なわない。発言の途中を切らない。\n- 不要な長い沈黙、明確な言い直し、重複だけを慎重に候補化する。\n- 話題転換には必要に応じてジングルを置く。\n- BGMは会話を邪魔しない音量にする。\n- 不確かな編集は実行せず、notesに理由を書く。\n\n出力は説明文やMarkdown囲みなしのJSONのみ。形式:\n{\"version\":1,\"operations\":[{\"type\":\"cut\",\"start\":12.5,\"end\":18.2,\"reason\":\"理由\"},{\"type\":\"bgm\",\"start\":0,\"end\":60,\"track\":\"main\",\"volume\":0.12,\"fade_in\":2,\"fade_out\":3},{\"type\":\"fade\",\"start\":58,\"end\":60,\"effect\":\"out\"},{\"type\":\"marker\",\"time\":120,\"label\":\"話題転換\"}],\"notes\":[\"確認事項\"]}\n\n利用可能な操作:\n- cut: start/end秒。音源から区間を削除\n- bgm: start/end秒、trackは\"main\"、volumeは0〜1、fade_in/fade_outは任意の秒数。BGMは指定区間だけ再生し、カットされた区間では元音源時間に沿って進める\n- fade: start/end秒、effectは\"in\"または\"out\"。指定範囲で音量をフェード\n- marker: time秒、label文字列（編集目印のみ）\n\n時刻はすべて元音源上の秒数です。音源の長さを超えないでください。カット区間を重複させないください。\n\n文字起こし:\n${$("transcript").value}`;
 }
 $("copyPrompt").onclick = async () => { try { await navigator.clipboard.writeText(promptText()); $("copyPrompt").textContent = "コピーしました"; } catch { $("transcript").value = promptText(); alert("コピーできないため、文字起こし欄に依頼文を表示しました。"); } };
 function dl(text, name, type) { const u = URL.createObjectURL(new Blob([text], { type })), a = document.createElement("a"); a.href = u; a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(u), 1000); }
@@ -113,48 +187,27 @@ function renderTimeline() {
 }
 let ffLoadPromise = null;
 async function loadFF() {
-  // Reuse only a fully initialized instance. A failed load must never leave a
-  // truthy FFmpeg object behind, otherwise later calls skip load() and fail
-  // with "ffmpeg is not loaded".
   if (ff && ff.loaded) return ff;
   if (ffLoadPromise) return ffLoadPromise;
-
   ffLoadPromise = (async () => {
     const candidate = new FFmpeg();
-    candidate.on("progress", ({ progress }) => {
-      editProgress(45 + Math.round((progress || 0) * 45), "音声をレンダリング中…");
-    });
-    candidate.on("log", ({ message }) => {
-      // Keep FFmpeg logs out of blocking alert dialogs; surface useful details
-      // only when loading/execution fails.
-      candidate.lastLog = message;
-    });
-
+    candidate.on("progress", ({ progress }) => { editProgress(45 + Math.round((progress || 0) * 45), "音声をレンダリング中…"); });
+    candidate.on("log", ({ message }) => { candidate.lastLog = message; });
     const base = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd";
     try {
       editProgress(8, "FFmpeg本体をダウンロード中…");
-      const [coreURL, wasmURL] = await Promise.all([
-        toBlobURL(base + "/ffmpeg-core.js", "text/javascript"),
-        toBlobURL(base + "/ffmpeg-core.wasm", "application/wasm")
-      ]);
+      const [coreURL, wasmURL] = await Promise.all([ toBlobURL(base + "/ffmpeg-core.js", "text/javascript"), toBlobURL(base + "/ffmpeg-core.wasm", "application/wasm") ]);
       editProgress(25, "FFmpegを初期化中…");
       await candidate.load({ coreURL, wasmURL });
       if (!candidate.loaded) throw new Error("FFmpegの初期化完了を確認できませんでした。");
-      ff = candidate;
-      return candidate;
+      ff = candidate; return candidate;
     } catch (error) {
       try { candidate.terminate(); } catch {}
-      ff = null;
-      const detail = error?.message || String(error);
+      ff = null; const detail = error?.message || String(error);
       throw new Error("FFmpegの読み込みに失敗しました。ページを再読み込みして再試行してください。詳細: " + detail);
     }
   })();
-
-  try {
-    return await ffLoadPromise;
-  } finally {
-    ffLoadPromise = null;
-  }
+  try { return await ffLoadPromise; } finally { ffLoadPromise = null; }
 }
 function mapOriginalTime(time, keep) {
   let offset = 0;
@@ -172,7 +225,7 @@ async function render() {
   for (let i = 1; i < cuts.length; i++) if (cuts[i].start < cuts[i - 1].end) throw Error("カット区間が重複しています。");
   const keep = []; let cur = 0;
   cuts.forEach(c => { if (c.start > cur) keep.push([cur, c.start]); cur = c.end; }); if (cur < duration) keep.push([cur, duration]);
-  if (!keep.length) throw Error("音声全体がカットされています。");
+  if (!keep.length) throw Error("音声全体がカットされていま。");
   const f = await loadFF();
   const ext = (source.name.split(".").pop() || "wav").toLowerCase().replace(/[^a-z0-9]/g, "");
   await f.writeFile("source." + ext, await fetchFile(source));
@@ -207,10 +260,7 @@ async function render() {
   let map = "[voice]";
   if (bgmPieces.length) { filters.push(`[voice]${bgmPieces.join("")}amix=inputs=${bgmPieces.length + 1}:duration=first:dropout_transition=0:normalize=0[mixed]`); map = "[mixed]"; }
   const fades = ops.filter(o => o.type === "fade");
-  fades.forEach((o, i) => {
-    const s = mapOriginalTime(o.start, keep), e = mapOriginalTime(o.end, keep), d = Math.max(.01, e - s), next = `fade${i}`;
-    filters.push(`${map}afade=t=${o.effect}:st=${s}:d=${d}[${next}]`); map = `[${next}]`;
-  });
+  fades.forEach((o, i) => { const s = mapOriginalTime(o.start, keep), e = mapOriginalTime(o.end, keep), d = Math.max(.01, e - s), next = `fade${i}`; filters.push(`${map}afade=t=${o.effect}:st=${s}:d=${d}[${next}]`); map = `[${next}]`; });
   const format = $("format").value, out = "final." + format;
   args.push("-filter_complex", filters.join(";"), "-map", map);
   if (format === "mp3") args.push("-c:a", "libmp3lame", "-b:a", "192k", out); else args.push("-c:a", "pcm_s16le", out);
@@ -228,13 +278,7 @@ $("execute").onclick = async () => {
   } catch (e) {
     editProgress(0, "編集できませんでした: " + (e?.message || String(e)));
     let errorBox = $("editError");
-    if (!errorBox) {
-      errorBox = document.createElement("pre");
-      errorBox.id = "editError";
-      errorBox.className = "validation err";
-      $("editProgressBox").after(errorBox);
-    }
+    if (!errorBox) { errorBox = document.createElement("pre"); errorBox.id = "editError"; errorBox.className = "validation err"; $("editProgressBox").after(errorBox); }
     errorBox.textContent = e?.stack || e?.message || String(e);
-  }
-  finally { $("execute").disabled = false; }
+  } finally { $("execute").disabled = false; }
 };
