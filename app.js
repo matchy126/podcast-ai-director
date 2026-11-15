@@ -81,11 +81,18 @@ function stopElapsedTimer() {
   }
 }
 
-$("audio").onchange = (e) => {
-  const file = e.target.files?.[0];
-  if (file) setAudio(file);
-  e.target.value = "";
-};
+function bindFileInput(el, onFile) {
+  if (!el) return;
+  el.addEventListener("click", () => {
+    el.value = "";
+  });
+  el.addEventListener("change", (e) => {
+    const file = e.target.files?.[0];
+    if (file) onFile(file);
+  });
+}
+
+bindFileInput($("audio"), (file) => setAudio(file));
 
 function updateSkipTranscribeState() {
   const hasInstructions = Boolean(validated || $("instructions").value.trim());
@@ -163,29 +170,24 @@ dropEl.ondrop = (e) => {
   setAudio(e.dataTransfer.files[0]);
 };
 
-$("bgm").onchange = (e) => {
-  const file = e.target.files?.[0];
-  if (!file) return;
+bindFileInput($("bgm"), (file) => {
   bgm = file;
   $("bgmName").textContent = `選択中：${bgm.name}`;
-  e.target.value = "";
   if (validated) validate();
-};
+});
 
-$("se").onchange = async (e) => {
-  const file = e.target.files?.[0];
-  if (!file) return;
+bindFileInput($("se"), async (file) => {
   se = file;
   seDuration = null;
+  $("seName").textContent = `選択中：${se.name}`;
   try {
     seDuration = await getDuration(se);
     $("seName").textContent = `選択中：${se.name}（${seDuration.toFixed(1)}秒）`;
   } catch {
-    $("seName").textContent = `選択中：${se.name}`;
+    // Keep base filename display if duration probe fails
   }
-  e.target.value = "";
   if (validated) validate();
-};
+});
 
 $("seOnMarker").onchange = () => {
   if (validated) validate();
@@ -210,9 +212,7 @@ $("format").onchange = () => {
   if (validated) validate();
 };
 
-$("thumbnail").onchange = (e) => {
-  const file = e.target.files?.[0];
-  if (!file) return;
+bindFileInput($("thumbnail"), (file) => {
   thumbnail = file;
   if (thumbnailUrl) {
     URL.revokeObjectURL(thumbnailUrl);
@@ -225,10 +225,9 @@ $("thumbnail").onchange = (e) => {
   if ($("format").value !== "mp4") {
     $("format").value = "mp4";
   }
-  e.target.value = "";
   updateFormatUi();
   if (validated) validate();
-};
+});
 
 async function decodeAudioTo16kMono(file) {
   const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -264,7 +263,7 @@ async function decodeAudioTo16kMono(file) {
 
 function getWorker() {
   if (!activeWorker) {
-    activeWorker = new Worker("./transcribe-worker.js?v=0.6.9", { type: "module" });
+    activeWorker = new Worker("./transcribe-worker.js?v=0.7.0", { type: "module" });
   }
   return activeWorker;
 }
@@ -409,14 +408,13 @@ function dl(text, name, type) {
 $("downloadTranscript").onclick = () => dl($("transcript").value, "transcript.txt", "text/plain;charset=utf-8");
 $("downloadTranscriptJson").onclick = () => dl(JSON.stringify(transcriptObject(), null, 2), "transcript.json", "application/json");
 
-$("jsonFile").onchange = async (e) => {
-  const f = e.target.files?.[0];
-  if (f) {
-    $("instructions").value = await f.text();
-    e.target.value = "";
-    validate();
+bindFileInput($("jsonFile"), async (f) => {
+  $("instructions").value = await f.text();
+  if ($("jsonFileName")) {
+    $("jsonFileName").textContent = `選択中：${f.name}`;
   }
-};
+  validate();
+});
 
 $("sample").onclick = () => {
   const maxT = sourceDuration && sourceDuration > 10 ? Math.min(45, Math.floor(sourceDuration - 1)) : 45;

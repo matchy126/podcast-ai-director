@@ -842,3 +842,38 @@ footer {
   color: var(--ok);
   font-weight: 600;
 }
+
+.field-group {
+  flex: 1 1 240px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field-group > label:first-child {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.field-group input[type="file"] {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 14px;
+}
+
+.field-group > small {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+.inline-file-status {
+  font-size: 12px;
+  color: var(--ok);
+  font-weight: 600;
+}

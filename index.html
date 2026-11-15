@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#101827">
 <title>Podcast AI Director</title>
-<link rel="stylesheet" href="./style.css?v=0.6.9">
+<link rel="stylesheet" href="./style.css?v=0.7.0">
 </head>
 <body>
 <header>
@@ -126,6 +126,7 @@
       <label class="filebtn" for="jsonFile">JSONファイルを選択<input id="jsonFile" type="file" accept=".json,application/json,text/plain"></label>
       <button class="secondary" id="sample" type="button">サンプルを挿入</button>
       <button class="secondary" id="validate" type="button">内容を検証</button>
+      <small id="jsonFileName" class="inline-file-status"></small>
     </div>
     <textarea id="instructions" spellcheck="false" placeholder='{"version":1,"skip_transcription_if_exists":true,"operations":[{"type":"cut","start":12.5,"end":18.2,"reason":"長い沈黙"},{"type":"se","time":20.0,"mode":"insert","duration":1.0,"visual":"black","volume":0.7,"label":"場面切り替え"}]}'></textarea>
     <div id="validation" class="validation"></div>
@@ -144,18 +145,20 @@
     </div>
 
     <div class="row controls">
-      <label>BGMファイル（任意）
+      <div class="field-group">
+        <label for="bgm">BGMファイル（任意）</label>
         <input id="bgm" type="file" accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg,.flac,.webm">
         <small id="bgmName">BGM未選択</small>
-      </label>
-      <label>場面切り替えSEファイル（任意）
+      </div>
+      <div class="field-group">
+        <label for="se">場面切り替えSEファイル（任意）</label>
         <input id="se" type="file" accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg,.flac,.webm">
         <small id="seName">SE未選択</small>
-        <span class="checkbox-inline">
+        <label class="checkbox-inline" for="seOnMarker">
           <input id="seOnMarker" type="checkbox" checked>
           <span>「MARK（話題転換）」位置にもSEを自動配置</span>
-        </span>
-      </label>
+        </label>
+      </div>
     </div>
 
     <div class="row controls">
@@ -177,13 +180,14 @@
     </div>
 
     <div class="row controls">
-      <label id="thumbnailField">MP4用サムネイル画像（任意）
+      <div class="field-group" id="thumbnailField">
+        <label for="thumbnail">MP4用サムネイル画像（任意）</label>
         <input id="thumbnail" type="file" accept="image/*,.png,.jpg,.jpeg,.webp">
         <small id="thumbnailName">サムネイル未選択（MP4出力時は単色背景）</small>
         <div class="thumb-preview-wrap" id="thumbnailPreviewWrap" hidden>
           <img id="thumbnailPreview" alt="サムネイルプレビュー">
         </div>
-      </label>
+      </div>
     </div>
 
     <button class="primary" id="execute" type="button">編集を実行</button>
@@ -207,8 +211,8 @@
     <p>編集指示はJSONとして読み込み、許可された操作だけを実行します。任意のJavaScriptやコードは実行しません。AIの指示を適用する前に、カット位置・BGM位置・SE位置・音量を必ず確認してください。初回はAIモデルとFFmpegのダウンロードが必要です。</p>
   </section>
 
-  <footer>Podcast AI Director · GitHub Pages edition · v0.6.9</footer>
+  <footer>Podcast AI Director · GitHub Pages edition · v0.7.0</footer>
 </main>
-<script type="module" src="./app.js?v=0.6.9"></script>
+<script type="module" src="./app.js?v=0.7.0"></script>
 </body>
 </html>
