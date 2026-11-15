@@ -10,6 +10,7 @@ let ffLoadPromise = null;
 let validated = null;
 let bgm = null;
 let se = null;
+let seDuration = null;
 let thumbnail = null;
 let thumbnailUrl = null;
 let sourceDuration = null;
@@ -90,15 +91,19 @@ function setAudio(f) {
   validated = null;
   $("audioName").textContent = `${f.name} · ${(f.size / 1048576).toFixed(1)} MB`;
   $("transcribe").disabled = false;
+  $("skipTranscribeHint").hidden = false;
   if (sourceUrl) URL.revokeObjectURL(sourceUrl);
   sourceUrl = URL.createObjectURL(f);
   const audio = new Audio(sourceUrl);
   audio.onloadedmetadata = () => {
     sourceDuration = audio.duration;
     $("sourceDuration").textContent = `音源の長さ：${fmt(sourceDuration)}`;
+    if ($("instructions").value.trim()) validate();
   };
   $("originalPreview").src = sourceUrl;
   $("compareCard").hidden = false;
+  $("transcriptCard").hidden = false;
+  $("jsonHeading").classList.toggle("subheading", !$("transcriptArea").hidden);
   $("output").hidden = true;
   setActiveStep(1);
 }
@@ -121,13 +126,27 @@ $("bgm").onchange = (e) => {
   if (validated) validate();
 };
 
-$("se").onchange = (e) => {
+$("se").onchange = async (e) => {
   se = e.target.files[0] || null;
-  $("seName").textContent = se ? `選択中：${se.name}` : "SE未選択";
+  seDuration = null;
+  if (se) {
+    try {
+      seDuration = await getDuration(se);
+      $("seName").textContent = `選択中：${se.name}（${seDuration.toFixed(1)}秒）`;
+    } catch {
+      $("seName").textContent = `選択中：${se.name}`;
+    }
+  } else {
+    $("seName").textContent = "SE未選択";
+  }
   if (validated) validate();
 };
 
 $("seOnMarker").onchange = () => {
+  if (validated) validate();
+};
+
+$("seMode").onchange = () => {
   if (validated) validate();
 };
 
@@ -203,7 +222,7 @@ async function decodeAudioTo16kMono(file) {
 
 function getWorker() {
   if (!activeWorker) {
-    activeWorker = new Worker("./transcribe-worker.js?v=0.6.6", { type: "module" });
+    activeWorker = new Worker("./transcribe-worker.js?v=0.6.7", { type: "module" });
   }
   return activeWorker;
 }
@@ -280,8 +299,11 @@ $("transcribe").onclick = async () => {
   try {
     progress(2, "文字起こしを準備中…");
     segments = await transcribe();
-    $("transcript").value = segments.map((s) => `[${fmt(s.start)} - ${fmt(s.end)}] ${s.text}`).join("\n");
+    $("transcript").value = segments.map((s) => `[${fmt(s.start)} - ${fmt(s.end)}] ${s.text}`).join("
+");
     $("transcriptCard").hidden = false;
+    $("transcriptArea").hidden = false;
+    $("jsonHeading").classList.add("subheading");
     setActiveStep(2);
     $("transcriptCard").scrollIntoView({ behavior: "smooth" });
   } catch (e) {
@@ -300,7 +322,30 @@ function transcriptObject() {
 }
 
 function promptText() {
-  return `あなたはポッドキャストの編集ディレクターです。以下のタイムスタンプ付き文字起こしを読み、編集指示JSONを作成してください。\n\n方針:\n- 会話の意味を損なわない。発言の途中を切らない。\n- 不要な長い沈黙、明確な言い直し、重複だけを慎重に候補化する。\n- 場面切り替えや話題転換には必要に応じてse（ジングル/効果音）またはmarkerを置く。\n- BGMは会話を邪魔しない音量にする。\n- 不確かな編集は実行せず、notesに理由を書く。\n\n出力は説明文やMarkdown囲みなしのJSONのみ。形式:\n{"version":1,"operations":[{"type":"cut","start":12.5,"end":18.2,"reason":"理由"},{"type":"bgm","start":0,"end":60,"track":"main","volume":0.12,"fade_in":2,"fade_out":3},{"type":"se","time":60,"volume":0.8,"label":"場面切り替え"},{"type":"fade","start":58,"end":60,"effect":"out"},{"type":"marker","time":120,"label":"話題転換"}],"notes":["確認事項"]}\n\n利用可能な操作:\n- cut: start/end秒。音源から区間を削除\n- bgm: start/end秒、trackは"main"、volumeは0〜1、fade_in/fade_outは任意の秒数。BGMは指定区間だけ再生し、カットされた区間では元音源時間に沿って進める\n- se: time秒、volumeは0〜1（省略時0.8）、label文字列。指定時刻に場面切り替えSE/ジングルを再生\n- fade: start/end秒、effectは"in"または"out"。指定範囲で音量をフェード\n- marker: time秒、label文字列（編集目印。SEファイル選択時はここにもSE挿入可能）\n\n時刻はすべて元音源上の秒数です。音源の長さを超えないでください。カット区間を重複させないでください。\n\n文字起こし:\n${$("transcript").value}`;
+  return `あなたはポッドキャストの編集ディレクターです。以下のタイムスタンプ付き文字起こしを読み、編集指示JSONを作成してください。
+
+方針:
+- 会話の意味を損なわない。発言の途中を切らない。
+- 不要な長い沈黙、明確な言い直し、重複だけを慎重に候補化する。
+- 場面切り替えや話題転換には se（mode:"insert" で割り込み挿入）または marker を置く。
+- BGMは会話を邪魔しない音量にする。
+- フェード（fade）は本編の最初と最後のみに適用する。
+- 不確かな編集は実行せず、notesに理由を書く。
+
+出力は説明文やMarkdown囲みなしのJSONのみ。形式:
+{"version":1,"skip_transcription_if_exists":true,"operations":[{"type":"cut","start":12.5,"end":18.2,"reason":"理由"},{"type":"bgm","start":0,"end":60,"track":"main","volume":0.08,"fade_in":2,"fade_out":3},{"type":"se","time":60,"mode":"insert","duration":1.0,"visual":"black","volume":0.7,"label":"場面切り替え"},{"type":"fade","start":0,"end":1.5,"effect":"in"},{"type":"fade","start":58,"end":60,"effect":"out"},{"type":"marker","time":120,"label":"話題転換"}],"notes":["確認事項"]}
+
+利用可能な操作:
+- cut: start/end秒。音源から区間を削除
+- bgm: start/end秒、trackは"main"、volumeは0〜1、fade_in/fade_outは任意の秒数
+- se: time秒、modeは"insert"（シーン境界に挿入し後ろの音声を押し出す）または"overlay"（重ねて再生）、durationは挿入秒数、visualは"black"（MP4時黒画面）、volumeは0〜1（省略時0.8）、label文字列
+- fade: start/end秒、effectは"in"または"out"
+- marker: time秒、label文字列
+
+時刻はすべて元音源上の秒数です。音源の長さを超えないでください。カット区間を重複させないでください。
+
+文字起こし:
+${$("transcript").value}`;
 }
 
 $("copyPrompt").onclick = async () => {
@@ -328,7 +373,10 @@ $("downloadTranscriptJson").onclick = () => dl(JSON.stringify(transcriptObject()
 
 $("jsonFile").onchange = async (e) => {
   const f = e.target.files[0];
-  if (f) $("instructions").value = await f.text();
+  if (f) {
+    $("instructions").value = await f.text();
+    validate();
+  }
 };
 
 $("sample").onclick = () => {
@@ -338,15 +386,18 @@ $("sample").onclick = () => {
   const seTime = Math.min(25, maxT);
   $("instructions").value = JSON.stringify({
     version: 1,
+    skip_transcription_if_exists: true,
     operations: [
+      { type: "bgm", start: 0, end: maxT, track: "main", volume: 0.08, fade_in: 1.5, fade_out: 2.0 },
+      { type: "fade", start: 0, end: 1.5, effect: "in" },
       { type: "cut", start: cutStart, end: cutEnd, reason: "サンプルのカット" },
-      { type: "bgm", start: 0, end: maxT, track: "main", volume: 0.1, fade_in: 1, fade_out: 2 },
-      { type: "se", time: seTime, volume: 0.8, label: "場面切り替えSE" },
-      { type: "fade", start: Math.max(0, maxT - 2), end: maxT, effect: "out" },
-      { type: "marker", time: maxT, label: "話題転換" }
+      { type: "se", time: seTime, mode: "insert", duration: 1.0, visual: "black", volume: 0.7, label: "場面切り替え" },
+      { type: "marker", time: seTime, label: "話題転換" },
+      { type: "fade", start: Math.max(0, maxT - 2), end: maxT, effect: "out" }
     ],
-    notes: ["サンプル指示です。実際の音源に合わせて時刻を修正してください。"]
+    notes: ["サンプル指示です。mode:'insert' によりSEの尺だけ後ろの音声が押し出されます。"]
   }, null, 2);
+  validate();
 };
 
 function parseInstructions() {
@@ -370,6 +421,12 @@ function parseInstructions() {
       if (o.volume != null && (!Number.isFinite(o.volume) || o.volume < 0 || o.volume > 1)) {
         throw Error(`操作${i + 1}: SEのvolumeは0〜1です`);
       }
+      if (o.mode != null && !["insert", "overlay"].includes(o.mode)) {
+        throw Error(`操作${i + 1}: SEのmodeは"insert"または"overlay"です`);
+      }
+      if (o.duration != null && (!Number.isFinite(o.duration) || o.duration <= 0)) {
+        throw Error(`操作${i + 1}: SEのdurationは0より大きい秒数です`);
+      }
       return { ...o, volume: o.volume != null ? o.volume : 0.8 };
     }
     if (!Number.isFinite(o.start) || !Number.isFinite(o.end) || o.start < 0 || o.end <= o.start) {
@@ -389,15 +446,33 @@ function parseInstructions() {
   return { ...obj, operations: ops };
 }
 
+function resolveSeMode(rawMode) {
+  const uiMode = $("seMode")?.value || "auto";
+  if (uiMode === "insert" || uiMode === "overlay") return uiMode;
+  return rawMode || "insert";
+}
+
+function resolveSeInsertDuration(rawDuration) {
+  if (Number.isFinite(rawDuration) && rawDuration > 0) return Number(rawDuration);
+  if (Number.isFinite(seDuration) && seDuration > 0) return Number(seDuration);
+  return 1.0;
+}
+
 function getEffectiveSeEvents(operations) {
   const explicitSe = operations
     .filter((o) => o.type === "se")
-    .map((o) => ({
-      time: o.time,
-      volume: o.volume != null ? o.volume : 0.8,
-      label: o.label || "場面切り替えSE",
-      fromMarker: false
-    }));
+    .map((o) => {
+      const mode = resolveSeMode(o.mode);
+      return {
+        time: o.time,
+        volume: o.volume != null ? o.volume : 0.8,
+        label: o.label || "場面切り替えSE",
+        mode,
+        duration: mode === "insert" ? resolveSeInsertDuration(o.duration) : 0,
+        visual: o.visual || "black",
+        fromMarker: false
+      };
+    });
 
   const combined = [...explicitSe];
   if ($("seOnMarker")?.checked) {
@@ -405,10 +480,14 @@ function getEffectiveSeEvents(operations) {
     for (const m of markers) {
       const isDuplicate = combined.some((ev) => Math.abs(ev.time - m.time) < 0.15);
       if (!isDuplicate) {
+        const mode = resolveSeMode("insert");
         combined.push({
           time: m.time,
           volume: 0.8,
           label: m.label || "話題転換SE",
+          mode,
+          duration: mode === "insert" ? resolveSeInsertDuration(null) : 0,
+          visual: "black",
           fromMarker: true
         });
       }
@@ -433,11 +512,21 @@ function validate() {
       }
     }
     const notes = [];
+    if (validated.skip_transcription_if_exists) {
+      notes.push("文字起こしスキップ有効");
+    }
+    const effectiveSe = getEffectiveSeEvents(validated.operations);
+    const insertCount = effectiveSe.filter((ev) => ev.mode === "insert").length;
+    if (insertCount > 0) {
+      notes.push(`SE挿入 ${insertCount}箇所（後ろの音声を押し出し）`);
+    }
+
     const hasBgm = validated.operations.some((o) => o.type === "bgm");
     if (hasBgm && !bgm) notes.push("BGM指示あり：STEP 04でBGMファイルを選択してください");
 
-    const hasExplicitSe = validated.operations.some((o) => o.type === "se");
-    if (hasExplicitSe && !se) notes.push("SE指示あり：STEP 04で場面切り替えSEファイルを選択してください");
+    if (effectiveSe.length > 0 && !se) {
+      notes.push("SE指示あり：STEP 04で場面切り替えSEファイルを選択してください");
+    }
 
     if ($("format").value === "mp4" && !thumbnail) {
       notes.push("MP4出力：サムネイル未選択のため単色背景で生成します");
@@ -472,10 +561,13 @@ function renderOps() {
     b.textContent = o.type.toUpperCase();
     const s = document.createElement("span");
     if (o.type === "marker") {
-      const seBadge = se && $("seOnMarker")?.checked ? " [SE挿入対象]" : "";
+      const modeLabel = resolveSeMode("insert") === "insert" ? "挿入" : "重ねる";
+      const seBadge = se && $("seOnMarker")?.checked ? ` [SE${modeLabel}対象]` : "";
       s.textContent = `${fmt(o.time)} · ${o.label || ""}${seBadge}`;
     } else if (o.type === "se") {
-      s.textContent = `${fmt(o.time)} · 音量 ${((o.volume ?? 0.8) * 100).toFixed(0)}% · ${o.label || "場面切り替えSE"}`;
+      const mode = resolveSeMode(o.mode);
+      const modeTag = mode === "insert" ? `挿入 ${resolveSeInsertDuration(o.duration).toFixed(1)}s` : "重ねる";
+      s.textContent = `${fmt(o.time)} · [${modeTag}] 音量 ${((o.volume ?? 0.8) * 100).toFixed(0)}% · ${o.label || "場面切り替えSE"}`;
     } else if (o.type === "bgm") {
       s.textContent = `${fmt(o.start)} – ${fmt(o.end)} · 音量 ${(o.volume * 100).toFixed(0)}% / IN ${o.fade_in || 0}s / OUT ${o.fade_out || 0}s`;
     } else {
@@ -515,18 +607,21 @@ function renderTimeline() {
     rail.className = "timeline-rail";
 
     const items = t.type === "se"
-      ? effectiveSe.map((ev) => ({ type: "se", time: ev.time, label: ev.label, fromMarker: ev.fromMarker }))
+      ? effectiveSe.map((ev) => ({ type: "se", time: ev.time, label: ev.label, mode: ev.mode, fromMarker: ev.fromMarker }))
       : validated.operations.filter((o) => o.type === t.type);
 
     items.forEach((o) => {
       const el = document.createElement("span");
-      el.className = `timeline-event ${t.type}${o.fromMarker ? " from-marker" : ""}`;
+      const modeClass = t.type === "se" && o.mode === "insert" ? " insert-mode" : "";
+      el.className = `timeline-event ${t.type}${o.fromMarker ? " from-marker" : ""}${modeClass}`;
       const isPoint = t.type === "marker" || t.type === "se";
       const start = isPoint ? o.time : o.start;
       const end = isPoint ? o.time + duration * 0.008 : o.end;
       el.style.left = `${Math.max(0, (start / duration) * 100)}%`;
       el.style.width = `${Math.max(isPoint ? 1.0 : 0.5, ((end - start) / duration) * 100)}%`;
-      el.title = isPoint ? `${fmt(o.time)} ${o.label || ""}` : `${fmt(o.start)}-${fmt(o.end)}`;
+      el.title = isPoint
+        ? `${fmt(o.time)} ${o.label || ""}${o.mode === "insert" ? "（挿入）" : ""}`
+        : `${fmt(o.start)}-${fmt(o.end)}`;
       el.tabIndex = 0;
       el.setAttribute("role", "button");
       el.setAttribute("aria-label", `元音源 ${fmt(start)} に移動`);
@@ -590,14 +685,75 @@ async function loadFF() {
   }
 }
 
-function mapOriginalTime(time, keep) {
-  let offset = 0;
-  for (const [s, e] of keep) {
-    if (time <= s) return offset;
-    if (time < e) return offset + time - s;
-    offset += e - s;
+function buildTimelineSegments(keep, insertEvents) {
+  const sortedInserts = [...insertEvents].sort((a, b) => a.time - b.time);
+  const usedInsertIndices = new Set();
+  const timeline = [];
+  let outCursor = 0;
+
+  for (let kIdx = 0; kIdx < keep.length; kIdx++) {
+    const [ks, ke] = keep[kIdx];
+    const isLastKeep = kIdx === keep.length - 1;
+    let subCur = ks;
+
+    for (let i = 0; i < sortedInserts.length; i++) {
+      if (usedInsertIndices.has(i)) continue;
+      const ev = sortedInserts[i];
+      const inRange = (ev.time >= ks && ev.time < ke) || (isLastKeep && Math.abs(ev.time - ke) < 0.05);
+      if (!inRange) continue;
+
+      usedInsertIndices.add(i);
+      const splitPoint = Math.min(ke, Math.max(ks, ev.time));
+      if (splitPoint > subCur + 0.001) {
+        const pieceDur = splitPoint - subCur;
+        timeline.push({
+          kind: "source",
+          origStart: subCur,
+          origEnd: splitPoint,
+          outStart: outCursor,
+          outEnd: outCursor + pieceDur
+        });
+        outCursor += pieceDur;
+      }
+
+      const insDur = Math.max(0.05, Number(ev.duration) || 1.0);
+      timeline.push({
+        kind: "insert",
+        origTime: splitPoint,
+        outStart: outCursor,
+        outEnd: outCursor + insDur,
+        seEvent: ev
+      });
+      outCursor += insDur;
+      subCur = splitPoint;
+    }
+
+    if (ke > subCur + 0.001) {
+      const pieceDur = ke - subCur;
+      timeline.push({
+        kind: "source",
+        origStart: subCur,
+        origEnd: ke,
+        outStart: outCursor,
+        outEnd: outCursor + pieceDur
+      });
+      outCursor += pieceDur;
+    }
   }
-  return offset;
+
+  return { timeline, totalOutDuration: outCursor };
+}
+
+function mapOriginalToOutput(origTime, timeline, totalOutDuration) {
+  for (const seg of timeline) {
+    if (seg.kind === "source") {
+      if (origTime <= seg.origStart) return seg.outStart;
+      if (origTime < seg.origEnd) return seg.outStart + (origTime - seg.origStart);
+    } else if (seg.kind === "insert") {
+      if (origTime <= seg.origTime) return seg.outEnd;
+    }
+  }
+  return totalOutDuration;
 }
 
 async function getDuration(file) {
@@ -648,11 +804,14 @@ async function render() {
     throw Error("BGM指示がありますが、BGMファイルが選択されていません。");
   }
 
-  const hasExplicitSe = ops.some((o) => o.type === "se");
-  if (hasExplicitSe && !se) {
+  const allSeEvents = getEffectiveSeEvents(obj.operations);
+  if (allSeEvents.length > 0 && !se) {
     throw Error("SE指示がありますが、場面切り替えSEファイルが選択されていません。");
   }
-  const seEvents = se ? getEffectiveSeEvents(obj.operations) : [];
+
+  const insertSeEvents = se ? allSeEvents.filter((ev) => ev.mode === "insert") : [];
+  const overlaySeEvents = se ? allSeEvents.filter((ev) => ev.mode !== "insert") : [];
+  const { timeline, totalOutDuration } = buildTimelineSegments(keep, insertSeEvents);
 
   const f = await loadFF();
   const ext = (source.name.split(".").pop() || "wav").toLowerCase().replace(/[^a-z0-9]/g, "") || "wav";
@@ -667,8 +826,17 @@ async function render() {
 
     const filters = [];
     const labels = [];
-    keep.forEach(([s, e], i) => {
-      filters.push(`[0:a]atrim=start=${s}:end=${e},asetpts=PTS-STARTPTS[a${i}]`);
+    timeline.forEach((seg, i) => {
+      if (seg.kind === "source") {
+        filters.push(
+          `[0:a]atrim=start=${seg.origStart}:end=${seg.origEnd},asetpts=PTS-STARTPTS,aformat=sample_rates=44100:channel_layouts=stereo[a${i}]`
+        );
+      } else {
+        const dur = Math.max(0.05, seg.outEnd - seg.outStart);
+        filters.push(
+          `anullsrc=r=44100:cl=stereo,atrim=duration=${dur},asetpts=PTS-STARTPTS[a${i}]`
+        );
+      }
       labels.push(`[a${i}]`);
     });
     filters.push(`${labels.join("")}concat=n=${labels.length}:v=0:a=1[voice]`);
@@ -687,27 +855,28 @@ async function render() {
 
       let n = 0;
       for (const op of bgmOps) {
-        for (const [ks, ke] of keep) {
-          const s = Math.max(op.start, ks);
-          const e = Math.min(op.end, ke);
+        for (const seg of timeline) {
+          if (seg.kind !== "source") continue;
+          const s = Math.max(op.start, seg.origStart);
+          const e = Math.min(op.end, seg.origEnd);
           if (e <= s) continue;
-          const outputStart = mapOriginalTime(s, keep);
+          const outputStart = seg.outStart + (s - seg.origStart);
           const trackOffset = s - op.start;
           const delay = Math.max(0, Math.round(outputStart * 1000));
           const label = `bed${n++}`;
           const pieceDuration = e - s;
           const fadeIn = Math.min(Number(op.fade_in || 0), pieceDuration);
           const fadeOut = Math.min(Number(op.fade_out || 0), pieceDuration);
-          let chain = `[${bgmInputIdx}:a]atrim=start=${trackOffset}:duration=${pieceDuration},asetpts=PTS-STARTPTS,volume=${op.volume}`;
-          if (fadeIn > 0) chain += `,afade=t=in:st=0:d=${fadeIn}`;
-          if (fadeOut > 0) chain += `,afade=t=out:st=${Math.max(0, pieceDuration - fadeOut)}:d=${fadeOut}`;
+          let chain = `[${bgmInputIdx}:a]aformat=sample_rates=44100:channel_layouts=stereo,atrim=start=${trackOffset}:duration=${pieceDuration},asetpts=PTS-STARTPTS,volume=${op.volume}`;
+          if (fadeIn > 0 && Math.abs(s - op.start) < 0.05) chain += `,afade=t=in:st=0:d=${fadeIn}`;
+          if (fadeOut > 0 && Math.abs(e - op.end) < 0.05) chain += `,afade=t=out:st=${Math.max(0, pieceDuration - fadeOut)}:d=${fadeOut}`;
           filters.push(`${chain},adelay=${delay}|${delay}[${label}]`);
           mixInputs.push(`[${label}]`);
         }
       }
     }
 
-    if (se && seEvents.length) {
+    if (se && (insertSeEvents.length || overlaySeEvents.length)) {
       const sext = (se.name.split(".").pop() || "mp3").toLowerCase().replace(/[^a-z0-9]/g, "") || "mp3";
       const seName = `se.${sext}`;
       tempFiles.push(seName);
@@ -715,13 +884,27 @@ async function render() {
       const seInputIdx = nextInputIdx++;
       args.push("-i", seName);
 
-      seEvents.forEach((ev, idx) => {
-        const outputStart = mapOriginalTime(ev.time, keep);
-        const delay = Math.max(0, Math.round(outputStart * 1000));
-        const label = `sfx${idx}`;
-        filters.push(`[${seInputIdx}:a]asetpts=PTS-STARTPTS,volume=${ev.volume},adelay=${delay}|${delay}[${label}]`);
+      let sfxIdx = 0;
+      for (const seg of timeline) {
+        if (seg.kind !== "insert") continue;
+        const delay = Math.max(0, Math.round(seg.outStart * 1000));
+        const dur = Math.max(0.05, seg.outEnd - seg.outStart);
+        const label = `sfx${sfxIdx++}`;
+        filters.push(
+          `[${seInputIdx}:a]aformat=sample_rates=44100:channel_layouts=stereo,atrim=0:${dur},asetpts=PTS-STARTPTS,volume=${seg.seEvent.volume},adelay=${delay}|${delay}[${label}]`
+        );
         mixInputs.push(`[${label}]`);
-      });
+      }
+
+      for (const ev of overlaySeEvents) {
+        const outputStart = mapOriginalToOutput(ev.time, timeline, totalOutDuration);
+        const delay = Math.max(0, Math.round(outputStart * 1000));
+        const label = `sfx${sfxIdx++}`;
+        filters.push(
+          `[${seInputIdx}:a]aformat=sample_rates=44100:channel_layouts=stereo,asetpts=PTS-STARTPTS,volume=${ev.volume},adelay=${delay}|${delay}[${label}]`
+        );
+        mixInputs.push(`[${label}]`);
+      }
     }
 
     let map = "[voice]";
@@ -732,11 +915,12 @@ async function render() {
 
     const fades = ops.filter((o) => o.type === "fade");
     fades.forEach((o, i) => {
-      const s = mapOriginalTime(o.start, keep);
-      const e = mapOriginalTime(o.end, keep);
-      const d = Math.max(0.01, e - s);
+      const d = Math.max(0.01, o.end - o.start);
+      const st = o.effect === "out"
+        ? Math.max(0, totalOutDuration - d)
+        : mapOriginalToOutput(o.start, timeline, totalOutDuration);
       const next = `fade${i}`;
-      filters.push(`${map}afade=t=${o.effect}:st=${s}:d=${d}[${next}]`);
+      filters.push(`${map}afade=t=${o.effect}:st=${st}:d=${d}[${next}]`);
       map = `[${next}]`;
     });
 
@@ -757,6 +941,13 @@ async function render() {
     args.push("-filter_complex", filters.join(";"));
 
     if (format === "mp4") {
+      const blackWindows = timeline
+        .filter((seg) => seg.kind === "insert" && seg.seEvent?.visual === "black")
+        .map((seg) => `between(t,${seg.outStart.toFixed(3)},${seg.outEnd.toFixed(3)})`);
+      let vf = "scale='min(1920,iw)':'min(1920,ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p";
+      if (blackWindows.length) {
+        vf += `,drawbox=c=black:t=fill:enable='${blackWindows.join("+")}'`;
+      }
       args.push(
         "-map", `${thumbInputIdx}:v`,
         "-map", map,
@@ -764,7 +955,7 @@ async function render() {
         "-tune", "stillimage",
         "-preset", "ultrafast",
         "-crf", "23",
-        "-vf", "scale='min(1920,iw)':'min(1920,ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+        "-vf", vf,
         "-c:a", "aac",
         "-b:a", "192k",
         "-shortest",
@@ -790,7 +981,7 @@ async function render() {
       try {
         await f.deleteFile(fileName);
       } catch {
-        // Ignore cleanup failure if file was not created
+        // Ignore cleanup failure
       }
     }
   }

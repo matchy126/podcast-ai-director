@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#101827">
 <title>Podcast AI Director</title>
-<link rel="stylesheet" href="./style.css?v=0.6.6">
+<link rel="stylesheet" href="./style.css?v=0.6.7">
 </head>
 <body>
 <header>
@@ -63,6 +63,7 @@
       <button class="primary" id="transcribe" disabled>タイムスタンプ付き文字起こしを作成</button>
       <button class="secondary" id="cancelTranscribe" type="button" hidden>処理を中止</button>
     </div>
+    <p class="hint" id="skipTranscribeHint" hidden>※ 既に編集指示JSONをお持ちの場合は、文字起こしをスキップして下の STEP 03 から直接読み込めます。</p>
     <div class="progressbox" id="progressbox" hidden>
       <div class="progress-head">
         <span id="progressText">準備中</span>
@@ -96,29 +97,31 @@
   </section>
 
   <section class="card" id="transcriptCard" hidden>
-    <div class="heading">
-      <div><small>STEP 02</small><h2>文字起こしをAIに渡す</h2></div>
-      <span class="tag">TXT / JSON</span>
+    <div id="transcriptArea" hidden>
+      <div class="heading">
+        <div><small>STEP 02</small><h2>文字起こしをAIに渡す</h2></div>
+        <span class="tag">TXT / JSON</span>
+      </div>
+      <p class="hint">タイムスタンプ付きの文字起こしと、AIへの編集依頼テンプレートを出力します。ChatGPT・Gemini・Claudeなど好きなAIに渡してください。</p>
+      <div class="row buttons">
+        <button class="secondary" id="copyPrompt">AI依頼文をコピー</button>
+        <button class="secondary" id="downloadTranscript">文字起こしTXT</button>
+        <button class="secondary" id="downloadTranscriptJson">文字起こしJSON</button>
+      </div>
+      <textarea id="transcript" spellcheck="false"></textarea>
     </div>
-    <p class="hint">タイムスタンプ付きの文字起こしと、AIへの編集依頼テンプレートを出力します。ChatGPT・Gemini・Claudeなど好きなAIに渡してください。</p>
-    <div class="row buttons">
-      <button class="secondary" id="copyPrompt">AI依頼文をコピー</button>
-      <button class="secondary" id="downloadTranscript">文字起こしTXT</button>
-      <button class="secondary" id="downloadTranscriptJson">文字起こしJSON</button>
-    </div>
-    <textarea id="transcript" spellcheck="false"></textarea>
 
-    <div class="heading subheading">
+    <div class="heading subheading" id="jsonHeading">
       <div><small>STEP 03</small><h2>AIが作成した編集指示を読み込む</h2></div>
       <span class="tag">JSON</span>
     </div>
-    <p class="hint">AIに編集指示JSONを作ってもらい、ここに貼り付けるかファイルを読み込んでください。</p>
+    <p class="hint">AIに編集指示JSONを作ってもらい、ここに貼り付けるかファイルを読み込んでください（既存JSONがある場合は文字起こし不要）。</p>
     <div class="row buttons">
       <label class="filebtn">JSONファイルを選択<input id="jsonFile" type="file" accept=".json,application/json"></label>
       <button class="secondary" id="sample">サンプルを挿入</button>
       <button class="secondary" id="validate">内容を検証</button>
     </div>
-    <textarea id="instructions" spellcheck="false" placeholder='{"version":1,"operations":[{"type":"cut","start":12.5,"end":18.2,"reason":"長い沈黙"}]}'></textarea>
+    <textarea id="instructions" spellcheck="false" placeholder='{"version":1,"skip_transcription_if_exists":true,"operations":[{"type":"cut","start":12.5,"end":18.2,"reason":"長い沈黙"},{"type":"se","time":20.0,"mode":"insert","duration":1.0,"visual":"black","volume":0.7,"label":"場面切り替え"}]}'></textarea>
     <div id="validation" class="validation"></div>
   </section>
 
@@ -144,12 +147,20 @@
         <small id="seName">SE未選択</small>
         <span class="checkbox-inline">
           <input id="seOnMarker" type="checkbox" checked>
-          <span>「MARK（話題転換）」位置にもSEを自動挿入</span>
+          <span>「MARK（話題転換）」位置にもSEを自動配置</span>
         </span>
       </label>
     </div>
 
     <div class="row controls">
+      <label>SEの入れ方
+        <select id="seMode">
+          <option value="auto" selected>JSON指定に従う（未指定時は挿入）</option>
+          <option value="insert">挿入（シーン境界に割り込み・後ろの音声を押し出す）</option>
+          <option value="overlay">重ねる（既存音声・BGMの上に重ねて再生）</option>
+        </select>
+        <small>「挿入」は元音声やBGMを削らず、SEの尺だけ間を作って鳴らします</small>
+      </label>
       <label>出力形式
         <select id="format">
           <option value="mp3">MP3（標準音声・軽量）</option>
@@ -157,6 +168,9 @@
           <option value="mp4">MP4（サムネイル画像付き動画）</option>
         </select>
       </label>
+    </div>
+
+    <div class="row controls">
       <label id="thumbnailField">MP4用サムネイル画像（任意）
         <input id="thumbnail" type="file" accept="image/png,image/jpeg,image/webp,image/*">
         <small id="thumbnailName">サムネイル未選択（MP4出力時は単色背景）</small>
@@ -187,8 +201,8 @@
     <p>編集指示はJSONとして読み込み、許可された操作だけを実行します。任意のJavaScriptやコードは実行しません。AIの指示を適用する前に、カット位置・BGM位置・SE位置・音量を必ず確認してください。初回はAIモデルとFFmpegのダウンロードが必要です。</p>
   </section>
 
-  <footer>Podcast AI Director · GitHub Pages edition · v0.6.6</footer>
+  <footer>Podcast AI Director · GitHub Pages edition · v0.6.7</footer>
 </main>
-<script type="module" src="./app.js?v=0.6.6"></script>
+<script type="module" src="./app.js?v=0.6.7"></script>
 </body>
 </html>
