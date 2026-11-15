@@ -1,5 +1,4 @@
-import { FFmpeg } from "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/index.js";
-import { fetchFile, toBlobURL } from "https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/dist/esm/index.js";
+// FFmpeg modules are loaded dynamically inside loadFF() so UI handlers always bind immediately.
 
 const $ = (id) => document.getElementById(id);
 
@@ -82,30 +81,74 @@ function stopElapsedTimer() {
   }
 }
 
-$("audio").onchange = (e) => setAudio(e.target.files[0]);
+$("audio").onchange = (e) => {
+  const file = e.target.files?.[0];
+  if (file) setAudio(file);
+  e.target.value = "";
+};
+
+function updateSkipTranscribeState() {
+  const hasInstructions = Boolean(validated || $("instructions").value.trim());
+  const banner = $("skipTranscribeBanner");
+  const hint = $("skipTranscribeHint");
+  const btn = $("transcribe");
+
+  if (hasInstructions) {
+    banner.classList.add("ready");
+    hint.textContent = source
+      ? "✓ 編集指示JSONが準備済みのため、文字起こしはスキップしてそのまま STEP 04 で編集を実行できます。"
+      : "✓ 編集指示JSONが準備済みです。上の枠から音源ファイルを選択すると、文字起こしなしでそのまま編集を実行できます。";
+    btn.textContent = "タイムスタンプ付き文字起こしを作成（任意・JSON読込済み）";
+  } else {
+    banner.classList.remove("ready");
+    hint.textContent = "すでに編集指示JSONをお持ちの場合は、文字起こしを実行せず下の STEP 03 から直接読み込めます。";
+    btn.textContent = "タイムスタンプ付き文字起こしを作成";
+  }
+  updateExecuteButtonState();
+}
+
+function updateExecuteButtonState() {
+  const execBtn = $("execute");
+  if (!execBtn) return;
+  if (!source) {
+    execBtn.disabled = true;
+    execBtn.textContent = "STEP 01 で収録音源を選択すると編集を実行できます";
+  } else {
+    execBtn.disabled = false;
+    execBtn.textContent = "編集を実行";
+  }
+}
 
 function setAudio(f) {
   if (!f) return;
   source = f;
   sourceDuration = null;
-  validated = null;
   $("audioName").textContent = `${f.name} · ${(f.size / 1048576).toFixed(1)} MB`;
   $("transcribe").disabled = false;
-  $("skipTranscribeHint").hidden = false;
   if (sourceUrl) URL.revokeObjectURL(sourceUrl);
   sourceUrl = URL.createObjectURL(f);
   const audio = new Audio(sourceUrl);
   audio.onloadedmetadata = () => {
     sourceDuration = audio.duration;
     $("sourceDuration").textContent = `音源の長さ：${fmt(sourceDuration)}`;
-    if ($("instructions").value.trim()) validate();
+    if ($("instructions").value.trim()) {
+      const ok = validate();
+      if (ok) {
+        $("editCard").scrollIntoView({ behavior: "smooth", block: "nearest" });
+      }
+    }
   };
   $("originalPreview").src = sourceUrl;
   $("compareCard").hidden = false;
   $("transcriptCard").hidden = false;
   $("jsonHeading").classList.toggle("subheading", !$("transcriptArea").hidden);
   $("output").hidden = true;
-  setActiveStep(1);
+  if ($("instructions").value.trim()) {
+    validate();
+  } else {
+    setActiveStep(1);
+  }
+  updateSkipTranscribeState();
 }
 
 const dropEl = $("drop");
@@ -121,24 +164,26 @@ dropEl.ondrop = (e) => {
 };
 
 $("bgm").onchange = (e) => {
-  bgm = e.target.files[0] || null;
-  $("bgmName").textContent = bgm ? `選択中：${bgm.name}` : "BGM未選択";
+  const file = e.target.files?.[0];
+  if (!file) return;
+  bgm = file;
+  $("bgmName").textContent = `選択中：${bgm.name}`;
+  e.target.value = "";
   if (validated) validate();
 };
 
 $("se").onchange = async (e) => {
-  se = e.target.files[0] || null;
+  const file = e.target.files?.[0];
+  if (!file) return;
+  se = file;
   seDuration = null;
-  if (se) {
-    try {
-      seDuration = await getDuration(se);
-      $("seName").textContent = `選択中：${se.name}（${seDuration.toFixed(1)}秒）`;
-    } catch {
-      $("seName").textContent = `選択中：${se.name}`;
-    }
-  } else {
-    $("seName").textContent = "SE未選択";
+  try {
+    seDuration = await getDuration(se);
+    $("seName").textContent = `選択中：${se.name}（${seDuration.toFixed(1)}秒）`;
+  } catch {
+    $("seName").textContent = `選択中：${se.name}`;
   }
+  e.target.value = "";
   if (validated) validate();
 };
 
@@ -166,24 +211,21 @@ $("format").onchange = () => {
 };
 
 $("thumbnail").onchange = (e) => {
-  thumbnail = e.target.files[0] || null;
+  const file = e.target.files?.[0];
+  if (!file) return;
+  thumbnail = file;
   if (thumbnailUrl) {
     URL.revokeObjectURL(thumbnailUrl);
     thumbnailUrl = null;
   }
-  if (thumbnail) {
-    thumbnailUrl = URL.createObjectURL(thumbnail);
-    $("thumbnailPreview").src = thumbnailUrl;
-    $("thumbnailPreviewWrap").hidden = false;
-    $("thumbnailName").textContent = `選択中：${thumbnail.name}`;
-    if ($("format").value !== "mp4") {
-      $("format").value = "mp4";
-    }
-  } else {
-    $("thumbnailPreview").removeAttribute("src");
-    $("thumbnailPreviewWrap").hidden = true;
-    $("thumbnailName").textContent = "サムネイル未選択（MP4出力時は単色背景）";
+  thumbnailUrl = URL.createObjectURL(thumbnail);
+  $("thumbnailPreview").src = thumbnailUrl;
+  $("thumbnailPreviewWrap").hidden = false;
+  $("thumbnailName").textContent = `選択中：${thumbnail.name}`;
+  if ($("format").value !== "mp4") {
+    $("format").value = "mp4";
   }
+  e.target.value = "";
   updateFormatUi();
   if (validated) validate();
 };
@@ -222,7 +264,7 @@ async function decodeAudioTo16kMono(file) {
 
 function getWorker() {
   if (!activeWorker) {
-    activeWorker = new Worker("./transcribe-worker.js?v=0.6.7", { type: "module" });
+    activeWorker = new Worker("./transcribe-worker.js?v=0.6.9", { type: "module" });
   }
   return activeWorker;
 }
@@ -289,6 +331,25 @@ $("cancelTranscribe").onclick = () => {
   progress(0, "中止しました", "必要に応じて再実行できます");
 };
 
+$("skipTranscribe").onclick = () => {
+  $("transcriptCard").hidden = false;
+  $("jsonHeading").classList.toggle("subheading", !$("transcriptArea").hidden);
+  setActiveStep(3);
+  $("transcriptCard").scrollIntoView({ behavior: "smooth", block: "start" });
+  $("instructions").focus();
+};
+
+$("toggleTranscriptBtn").onclick = () => {
+  const willShow = $("transcriptArea").hidden;
+  $("transcriptArea").hidden = !willShow;
+  $("jsonHeading").classList.toggle("subheading", willShow);
+  $("toggleTranscriptBtn").textContent = willShow ? "文字起こし欄を隠す" : "文字起こし欄を表示";
+};
+
+$("instructions").addEventListener("input", () => {
+  updateSkipTranscribeState();
+});
+
 $("transcribe").onclick = async () => {
   if (!source) return;
   $("transcribe").disabled = true;
@@ -299,11 +360,11 @@ $("transcribe").onclick = async () => {
   try {
     progress(2, "文字起こしを準備中…");
     segments = await transcribe();
-    $("transcript").value = segments.map((s) => `[${fmt(s.start)} - ${fmt(s.end)}] ${s.text}`).join("
-");
+    $("transcript").value = segments.map((s) => `[${fmt(s.start)} - ${fmt(s.end)}] ${s.text}`).join("\n");
     $("transcriptCard").hidden = false;
     $("transcriptArea").hidden = false;
     $("jsonHeading").classList.add("subheading");
+    $("toggleTranscriptBtn").textContent = "文字起こし欄を隠す";
     setActiveStep(2);
     $("transcriptCard").scrollIntoView({ behavior: "smooth" });
   } catch (e) {
@@ -322,30 +383,7 @@ function transcriptObject() {
 }
 
 function promptText() {
-  return `あなたはポッドキャストの編集ディレクターです。以下のタイムスタンプ付き文字起こしを読み、編集指示JSONを作成してください。
-
-方針:
-- 会話の意味を損なわない。発言の途中を切らない。
-- 不要な長い沈黙、明確な言い直し、重複だけを慎重に候補化する。
-- 場面切り替えや話題転換には se（mode:"insert" で割り込み挿入）または marker を置く。
-- BGMは会話を邪魔しない音量にする。
-- フェード（fade）は本編の最初と最後のみに適用する。
-- 不確かな編集は実行せず、notesに理由を書く。
-
-出力は説明文やMarkdown囲みなしのJSONのみ。形式:
-{"version":1,"skip_transcription_if_exists":true,"operations":[{"type":"cut","start":12.5,"end":18.2,"reason":"理由"},{"type":"bgm","start":0,"end":60,"track":"main","volume":0.08,"fade_in":2,"fade_out":3},{"type":"se","time":60,"mode":"insert","duration":1.0,"visual":"black","volume":0.7,"label":"場面切り替え"},{"type":"fade","start":0,"end":1.5,"effect":"in"},{"type":"fade","start":58,"end":60,"effect":"out"},{"type":"marker","time":120,"label":"話題転換"}],"notes":["確認事項"]}
-
-利用可能な操作:
-- cut: start/end秒。音源から区間を削除
-- bgm: start/end秒、trackは"main"、volumeは0〜1、fade_in/fade_outは任意の秒数
-- se: time秒、modeは"insert"（シーン境界に挿入し後ろの音声を押し出す）または"overlay"（重ねて再生）、durationは挿入秒数、visualは"black"（MP4時黒画面）、volumeは0〜1（省略時0.8）、label文字列
-- fade: start/end秒、effectは"in"または"out"
-- marker: time秒、label文字列
-
-時刻はすべて元音源上の秒数です。音源の長さを超えないでください。カット区間を重複させないでください。
-
-文字起こし:
-${$("transcript").value}`;
+  return `あなたはポッドキャストの編集ディレクターです。以下のタイムスタンプ付き文字起こしを読み、編集指示JSONを作成してください。\n\n方針:\n- 会話の意味を損なわない。発言の途中を切らない。\n- 不要な長い沈黙、明確な言い直し、重複だけを慎重に候補化する。\n- 場面切り替えや話題転換には se（mode:"insert" で割り込み挿入）または marker を置く。\n- BGMは会話を邪魔しない音量にする。\n- フェード（fade）は本編の最初と最後のみに適用する。\n- 不確かな編集は実行せず、notesに理由を書く。\n\n出力は説明文やMarkdown囲みなしのJSONのみ。形式:\n{"version":1,"skip_transcription_if_exists":true,"operations":[{"type":"cut","start":12.5,"end":18.2,"reason":"理由"},{"type":"bgm","start":0,"end":60,"track":"main","volume":0.08,"fade_in":2,"fade_out":3},{"type":"se","time":60,"mode":"insert","duration":1.0,"visual":"black","volume":0.7,"label":"場面切り替え"},{"type":"fade","start":0,"end":1.5,"effect":"in"},{"type":"fade","start":58,"end":60,"effect":"out"},{"type":"marker","time":120,"label":"話題転換"}],"notes":["確認事項"]}\n\n利用可能な操作:\n- cut: start/end秒。音源から区間を削除\n- bgm: start/end秒、trackは"main"、volumeは0〜1、fade_in/fade_outは任意の秒数\n- se: time秒、modeは"insert"（シーン境界に挿入し後ろの音声を押し出す）または"overlay"（重ねて再生）、durationは挿入秒数、visualは"black"（MP4時黒画面）、volumeは0〜1（省略時0.8）、label文字列\n- fade: start/end秒、effectは"in"または"out"\n- marker: time秒、label文字列\n\n時刻はすべて元音源上の秒数です。音源の長さを超えないでください。カット区間を重複させないでください。\n\n文字起こし:\n${$("transcript").value}`;
 }
 
 $("copyPrompt").onclick = async () => {
@@ -372,9 +410,10 @@ $("downloadTranscript").onclick = () => dl($("transcript").value, "transcript.tx
 $("downloadTranscriptJson").onclick = () => dl(JSON.stringify(transcriptObject(), null, 2), "transcript.json", "application/json");
 
 $("jsonFile").onchange = async (e) => {
-  const f = e.target.files[0];
+  const f = e.target.files?.[0];
   if (f) {
     $("instructions").value = await f.text();
+    e.target.value = "";
     validate();
   }
 };
@@ -404,7 +443,10 @@ function parseInstructions() {
   const raw = $("instructions").value.trim();
   if (!raw) throw Error("編集指示JSONが入力されていません。");
   const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
-  const obj = JSON.parse(cleaned);
+  const parsed = JSON.parse(cleaned);
+  const obj = Array.isArray(parsed)
+    ? { version: 1, skip_transcription_if_exists: true, operations: parsed }
+    : { version: parsed?.version ?? 1, ...parsed };
   if (obj.version !== 1 || !Array.isArray(obj.operations)) {
     throw Error("version:1 と operations 配列が必要です。");
   }
@@ -532,6 +574,12 @@ function validate() {
       notes.push("MP4出力：サムネイル未選択のため単色背景で生成します");
     }
 
+    if (!source) {
+      notes.unshift("文字起こしスキップ可能：STEP 01で収録音源を選択するとすぐ編集を実行できます");
+    } else {
+      notes.unshift("文字起こし不要：このままSTEP 04で編集を実行できます");
+    }
+
     const suffix = notes.length ? `（${notes.join(" / ")}）` : "";
     $("validation").className = "validation ok";
     $("validation").textContent = `検証OK：${validated.operations.length}件の操作。時刻は元音源基準です。${suffix}`;
@@ -539,12 +587,14 @@ function validate() {
     renderTimeline();
     $("editCard").hidden = false;
     setActiveStep(3);
+    updateSkipTranscribeState();
     return true;
   } catch (e) {
     validated = null;
     $("validation").className = "validation err";
     $("validation").textContent = "JSONエラー：" + formatError(e);
     $("editCard").hidden = true;
+    updateSkipTranscribeState();
     return false;
   }
 }
@@ -654,6 +704,11 @@ async function loadFF() {
   if (ffLoadPromise) return ffLoadPromise;
 
   ffLoadPromise = (async () => {
+    editProgress(4, "編集ライブラリを読み込み中…", "@ffmpeg/ffmpeg");
+    const [{ FFmpeg }, { fetchFile, toBlobURL }] = await Promise.all([
+      import("https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/index.js"),
+      import("https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/dist/esm/index.js")
+    ]);
     const instance = new FFmpeg();
     instance.on("progress", ({ progress: p }) => {
       const ratio = Number.isFinite(p) ? Math.min(1, Math.max(0, p)) : 0;
@@ -685,6 +740,9 @@ async function loadFF() {
   }
 }
 
+/**
+ * keep区間 と insert SE イベントから、出力タイムライン（source区間 / insert無音区間）を構築する
+ */
 function buildTimelineSegments(keep, insertEvents) {
   const sortedInserts = [...insertEvents].sort((a, b) => a.time - b.time);
   const usedInsertIndices = new Set();
@@ -814,6 +872,7 @@ async function render() {
   const { timeline, totalOutDuration } = buildTimelineSegments(keep, insertSeEvents);
 
   const f = await loadFF();
+  const { fetchFile } = await import("https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/dist/esm/index.js");
   const ext = (source.name.split(".").pop() || "wav").toLowerCase().replace(/[^a-z0-9]/g, "") || "wav";
   const srcName = `source.${ext}`;
   const format = $("format").value;
@@ -834,7 +893,7 @@ async function render() {
       } else {
         const dur = Math.max(0.05, seg.outEnd - seg.outStart);
         filters.push(
-          `anullsrc=r=44100:cl=stereo,atrim=duration=${dur},asetpts=PTS-STARTPTS[a${i}]`
+          `anullsrc=r=44100:cl=stereo,atrim=start=0:end=${dur},asetpts=PTS-STARTPTS[a${i}]`
         );
       }
       labels.push(`[a${i}]`);
@@ -845,6 +904,7 @@ async function render() {
     let nextInputIdx = 1;
     const mixInputs = [];
 
+    // BGM（source区間のみに配置し、insert挿入区間中は自動で無音にする）
     if (bgmOps.length) {
       const bext = (bgm.name.split(".").pop() || "mp3").toLowerCase().replace(/[^a-z0-9]/g, "") || "mp3";
       const bedName = `bed.${bext}`;
@@ -876,6 +936,7 @@ async function render() {
       }
     }
 
+    // SE（insert区間およびoverlay位置の双方を出力タイムラインへ配置）
     if (se && (insertSeEvents.length || overlaySeEvents.length)) {
       const sext = (se.name.split(".").pop() || "mp3").toLowerCase().replace(/[^a-z0-9]/g, "") || "mp3";
       const seName = `se.${sext}`;
@@ -891,7 +952,7 @@ async function render() {
         const dur = Math.max(0.05, seg.outEnd - seg.outStart);
         const label = `sfx${sfxIdx++}`;
         filters.push(
-          `[${seInputIdx}:a]aformat=sample_rates=44100:channel_layouts=stereo,atrim=0:${dur},asetpts=PTS-STARTPTS,volume=${seg.seEvent.volume},adelay=${delay}|${delay}[${label}]`
+          `[${seInputIdx}:a]aformat=sample_rates=44100:channel_layouts=stereo,atrim=start=0:end=${dur},asetpts=PTS-STARTPTS,volume=${seg.seEvent.volume},adelay=${delay}|${delay}[${label}]`
         );
         mixInputs.push(`[${label}]`);
       }
@@ -913,6 +974,7 @@ async function render() {
       map = "[mixed]";
     }
 
+    // フェード処理（最初と最後）
     const fades = ops.filter((o) => o.type === "fade");
     fades.forEach((o, i) => {
       const d = Math.max(0.01, o.end - o.start);
@@ -1026,3 +1088,5 @@ $("execute").onclick = async () => {
     $("execute").disabled = false;
   }
 };
+
+updateSkipTranscribeState();
