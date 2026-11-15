@@ -263,7 +263,7 @@ async function decodeAudioTo16kMono(file) {
 
 function getWorker() {
   if (!activeWorker) {
-    activeWorker = new Worker("./transcribe-worker.js?v=0.7.0", { type: "module" });
+    activeWorker = new Worker("./transcribe-worker.js?v=0.7.1", { type: "module" });
   }
   return activeWorker;
 }
@@ -902,7 +902,7 @@ async function render() {
     let nextInputIdx = 1;
     const mixInputs = [];
 
-    // BGM（source区間のみに配置し、insert挿入区間中は自動で無音にする）
+    // BGM（カットを跨いでも途切れず連続再生し、SE挿入区間のみ必要に応じてミュート）
     if (bgmOps.length) {
       const bext = (bgm.name.split(".").pop() || "mp3").toLowerCase().replace(/[^a-z0-9]/g, "") || "mp3";
       const bedName = `bed.${bext}`;
@@ -911,26 +911,49 @@ async function render() {
       const bgmInputIdx = nextInputIdx++;
       args.push("-stream_loop", "-1", "-i", bedName);
 
+      const muteOnInsert = $("muteBgmOnInsert")?.checked !== false;
+      const insertSegs = muteOnInsert ? timeline.filter((seg) => seg.kind === "insert") : [];
+
       let n = 0;
       for (const op of bgmOps) {
-        for (const seg of timeline) {
-          if (seg.kind !== "source") continue;
-          const s = Math.max(op.start, seg.origStart);
-          const e = Math.min(op.end, seg.origEnd);
-          if (e <= s) continue;
-          const outputStart = seg.outStart + (s - seg.origStart);
-          const trackOffset = s - op.start;
-          const delay = Math.max(0, Math.round(outputStart * 1000));
-          const label = `bed${n++}`;
-          const pieceDuration = e - s;
-          const fadeIn = Math.min(Number(op.fade_in || 0), pieceDuration);
-          const fadeOut = Math.min(Number(op.fade_out || 0), pieceDuration);
-          let chain = `[${bgmInputIdx}:a]aformat=sample_rates=44100:channel_layouts=stereo,atrim=start=${trackOffset}:duration=${pieceDuration},asetpts=PTS-STARTPTS,volume=${op.volume}`;
-          if (fadeIn > 0 && Math.abs(s - op.start) < 0.05) chain += `,afade=t=in:st=0:d=${fadeIn}`;
-          if (fadeOut > 0 && Math.abs(e - op.end) < 0.05) chain += `,afade=t=out:st=${Math.max(0, pieceDuration - fadeOut)}:d=${fadeOut}`;
-          filters.push(`${chain},adelay=${delay}|${delay}[${label}]`);
-          mixInputs.push(`[${label}]`);
+        const outBgmStart = mapOriginalToOutput(op.start, timeline, totalOutDuration);
+        const outBgmEnd = op.end >= duration - 0.05
+          ? totalOutDuration
+          : mapOriginalToOutput(op.end, timeline, totalOutDuration);
+        const bgmOutDuration = outBgmEnd - outBgmStart;
+        if (bgmOutDuration <= 0.05) continue;
+
+        const delay = Math.max(0, Math.round(outBgmStart * 1000));
+        const label = `bed${n++}`;
+        const fadeIn = Math.min(Number(op.fade_in || 0), bgmOutDuration);
+        const fadeOut = Math.min(Number(op.fade_out || 0), bgmOutDuration);
+
+        let chain = `[${bgmInputIdx}:a]aformat=sample_rates=44100:channel_layouts=stereo,atrim=start=0:duration=${bgmOutDuration.toFixed(4)},asetpts=PTS-STARTPTS,volume=${op.volume}`;
+        if (fadeIn > 0) {
+          chain += `,afade=t=in:st=0:d=${fadeIn}`;
         }
+        if (fadeOut > 0) {
+          chain += `,afade=t=out:st=${Math.max(0, bgmOutDuration - fadeOut).toFixed(4)}:d=${fadeOut}`;
+        }
+
+        // SE挿入（場面切り替え）区間中だけ連続BGMを一時ミュートする（ローカル時間基準）
+        const localMuteExprs = [];
+        for (const seg of insertSegs) {
+          const mStart = Math.max(0, seg.outStart - outBgmStart);
+          const mEnd = Math.min(bgmOutDuration, seg.outEnd - outBgmStart);
+          if (mEnd > mStart + 0.01) {
+            localMuteExprs.push(`between(t,${mStart.toFixed(3)},${mEnd.toFixed(3)})`);
+          }
+        }
+        if (localMuteExprs.length) {
+          chain += `,volume=0:enable='${localMuteExprs.join("+")}'`;
+        }
+
+        if (delay > 0) {
+          chain += `,adelay=${delay}|${delay}`;
+        }
+        filters.push(`${chain}[${label}]`);
+        mixInputs.push(`[${label}]`);
       }
     }
 

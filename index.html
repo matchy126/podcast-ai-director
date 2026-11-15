@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#101827">
 <title>Podcast AI Director</title>
-<link rel="stylesheet" href="./style.css?v=0.7.0">
+<link rel="stylesheet" href="./style.css?v=0.7.1">
 </head>
 <body>
 <header>
@@ -162,14 +162,18 @@
     </div>
 
     <div class="row controls">
-      <label>SEの入れ方
+      <div class="field-group">
+        <label for="seMode">SEの入れ方</label>
         <select id="seMode">
           <option value="auto" selected>JSON指定に従う（未指定時は挿入）</option>
           <option value="insert">挿入（シーン境界に割り込み・後ろの音声を押し出す）</option>
           <option value="overlay">重ねる（既存音声・BGMの上に重ねて再生）</option>
         </select>
-        <small>「挿入」は元音声やBGMを削らず、SEの尺だけ間を作って鳴らします</small>
-      </label>
+        <label class="checkbox-inline" for="muteBgmOnInsert">
+          <input id="muteBgmOnInsert" type="checkbox" checked>
+          <span>SE挿入中はBGMを一時ミュート（通常のカットではBGMは連続再生）</span>
+        </label>
+      </div>
       <label>出力形式
         <select id="format">
           <option value="mp3">MP3（標準音声・軽量）</option>
@@ -211,8 +215,8 @@
     <p>編集指示はJSONとして読み込み、許可された操作だけを実行します。任意のJavaScriptやコードは実行しません。AIの指示を適用する前に、カット位置・BGM位置・SE位置・音量を必ず確認してください。初回はAIモデルとFFmpegのダウンロードが必要です。</p>
   </section>
 
-  <footer>Podcast AI Director · GitHub Pages edition · v0.7.0</footer>
+  <footer>Podcast AI Director · GitHub Pages edition · v0.7.1</footer>
 </main>
-<script type="module" src="./app.js?v=0.7.0"></script>
+<script type="module" src="./app.js?v=0.7.1"></script>
 </body>
 </html>

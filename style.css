@@ -856,6 +856,7 @@ footer {
   color: var(--muted);
 }
 
+.field-group select,
 .field-group input[type="file"] {
   width: 100%;
   padding: 10px 12px;
