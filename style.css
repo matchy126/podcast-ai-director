@@ -278,7 +278,7 @@ main {
 }
 
 .controls > label {
-  flex: 1 1 240px;
+  flex: 1 1 210px;
   display: flex;
   flex-direction: column;
   gap: 6px;

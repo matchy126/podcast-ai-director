@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#101827">
 <title>Podcast AI Director</title>
-<link rel="stylesheet" href="./style.css?v=0.8.1">
+<link rel="stylesheet" href="./style.css?v=0.8.2">
 </head>
 <body>
 <header>
@@ -47,9 +47,15 @@
     <div class="row controls">
       <label>文字起こしモデル
         <select id="model">
-          <option value="tiny">Tiny・軽量（高速・低スペックPC向け）</option>
-          <option value="base" selected>Base・おすすめ（バランス型）</option>
-          <option value="small">Small・高精度（重い・メモリ注意）</option>
+          <option value="tiny">Tiny・超高速（下書き・確認向け）</option>
+          <option value="base" selected>Base・おすすめ（速度と精度のバランス型）</option>
+          <option value="small">Small・高精度（時間がかかります）</option>
+        </select>
+      </label>
+      <label>処理エンジン
+        <select id="accelDevice">
+          <option value="auto" selected>自動（WebGPU高速化優先）</option>
+          <option value="wasm">CPU標準モード（互換性重視）</option>
         </select>
       </label>
       <label>言語
@@ -57,6 +63,12 @@
           <option value="japanese" selected>日本語</option>
           <option value="english">英語</option>
         </select>
+      </label>
+    </div>
+    <div class="row" style="margin-top:-6px;margin-bottom:14px;">
+      <label class="checkbox-inline" for="skipSilenceVad" style="margin-top:0;">
+        <input id="skipSilenceVad" type="checkbox" checked>
+        <span>無音区間（沈黙）を自動スキップして文字起こしを高速化</span>
       </label>
     </div>
     <div class="row actions">
@@ -135,7 +147,7 @@
   <section class="card" id="editCard" hidden>
     <div class="heading">
       <div><small>STEP 04</small><h2>編集内容を確認して実行</h2></div>
-      <span class="tag">ブラウザ内軽量処理</span>
+      <span class="tag" id="estimatedDurationTag">完成予定尺: --:--</span>
     </div>
     <div id="operationList" class="ops"></div>
     <div class="timeline-wrap">
@@ -287,8 +299,8 @@
     <p>編集指示はJSONとして読み込み、許可された操作だけを実行します。任意のJavaScriptやコードは実行しません。AIの指示を適用する前に、カット位置・BGM位置・SE位置・音量を必ず確認してください。初回はAIモデルと変換エンジンのダウンロードが必要です。</p>
   </section>
 
-  <footer>Podcast AI Director · GitHub Pages edition · v0.8.1</footer>
+  <footer>Podcast AI Director · GitHub Pages edition · v0.8.2</footer>
 </main>
-<script type="module" src="./app.js?v=0.8.1"></script>
+<script type="module" src="./app.js?v=0.8.2"></script>
 </body>
 </html>

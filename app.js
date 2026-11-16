@@ -1,5 +1,5 @@
-// Podcast AI Director v0.8.1
-// Lightweight WebAudio Mixing + FFmpeg Single-Pass Mux (Multi-BGM, Intro/Outro Solo Boost, MP4 Telop)
+// Podcast AI Director v0.8.2
+// WebGPU + VAD Fast Transcription, Low-Memory WebAudio Mixing, Multi-BGM, Intro/Outro Solo Boost, MP4 Telop
 
 const $ = (id) => document.getElementById(id);
 
@@ -40,14 +40,15 @@ function formatError(err) {
   }
 }
 
-function getDeviceProfile() {
+function getDeviceProfile(durationSec = 0) {
   const rawMem = Number(navigator.deviceMemory);
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent || "");
   const isLowMem = Number.isFinite(rawMem) && rawMem <= 4;
-  if (isMobile || isLowMem) {
+  const isLongAudio = Number.isFinite(durationSec) && durationSec >= 1800; // 30分以上は自動省メモリ化
+  if (isMobile || isLowMem || isLongAudio) {
     return {
-      label: "省メモリモード",
-      sampleRate: 32000,
+      label: isLongAudio && !isMobile && !isLowMem ? "長尺省メモリモード" : "省メモリモード",
+      sampleRate: 24000,
       videoWidth: 854,
       videoHeight: 480,
       crf: "25"
@@ -55,7 +56,7 @@ function getDeviceProfile() {
   }
   return {
     label: "標準軽量モード",
-    sampleRate: 44100,
+    sampleRate: 32000,
     videoWidth: 1280,
     videoHeight: 720,
     crf: "23"
@@ -163,7 +164,7 @@ function updateExecuteButtonState() {
     execBtn.disabled = true;
     execBtn.textContent = "STEP 01 で収録音源を選択すると編集を実行できます";
   } else {
-    const profile = getDeviceProfile();
+    const profile = getDeviceProfile(sourceDuration || 0);
     execBtn.disabled = false;
     execBtn.textContent = `編集を実行（${profile.label}）`;
   }
@@ -181,6 +182,7 @@ function setAudio(f) {
   audio.onloadedmetadata = () => {
     sourceDuration = audio.duration;
     $("sourceDuration").textContent = `音源の長さ：${fmt(sourceDuration)}`;
+    updateExecuteButtonState();
     if ($("instructions").value.trim()) {
       const ok = validate();
       if (ok) {
@@ -360,7 +362,7 @@ bindFileInput($("se"), async (file) => {
     seDuration = await getDuration(se);
     $("seName").textContent = `選択中：${se.name}（${seDuration.toFixed(1)}秒）`;
   } catch {
-    // Keep base filename display if duration probe fails
+    // Keep base filename display
   }
   if (validated) validate();
 });
@@ -535,6 +537,7 @@ async function decodeAudioTo16kMono(file) {
   if (!sourceDuration && Number.isFinite(decoded.duration)) {
     sourceDuration = decoded.duration;
     $("sourceDuration").textContent = `音源の長さ：${fmt(sourceDuration)}`;
+    updateExecuteButtonState();
   }
 
   const targetRate = 16000;
@@ -552,7 +555,7 @@ async function decodeAudioTo16kMono(file) {
 
 function getWorker() {
   if (!activeWorker) {
-    activeWorker = new Worker("./transcribe-worker.js?v=0.8.1", { type: "module" });
+    activeWorker = new Worker("./transcribe-worker.js?v=0.8.2", { type: "module" });
   }
   return activeWorker;
 }
@@ -583,7 +586,9 @@ async function transcribe() {
         progress(pct, msg.text || "処理中…", msg.detail || "");
       } else if (msg.type === "result") {
         cleanup();
-        progress(100, "文字起こし完了", `${msg.segments?.length || 0} セグメント抽出`);
+        const engineTag = msg.deviceUsed === "webgpu" ? "WebGPU高速処理" : "CPU標準処理";
+        const savedTag = msg.savedSec >= 2 ? ` · 無音${Math.round(msg.savedSec)}秒スキップ` : "";
+        progress(100, `文字起こし完了（${engineTag}）`, `${msg.segments?.length || 0} セグメント抽出${savedTag}`);
         resolve(msg.segments || []);
       } else if (msg.type === "error") {
         cleanup();
@@ -604,7 +609,9 @@ async function transcribe() {
         type: "transcribe",
         audio: mono16k.buffer,
         model: $("model").value,
-        language: $("language").value
+        language: $("language").value,
+        accelDevice: $("accelDevice")?.value || "auto",
+        skipSilence: $("skipSilenceVad")?.checked !== false
       },
       [mono16k.buffer]
     );
@@ -826,6 +833,30 @@ function getEffectiveSeEvents(operations) {
   return combined.sort((a, b) => a.time - b.time);
 }
 
+function updateEstimatedDurationTag() {
+  const tagEl = $("estimatedDurationTag");
+  if (!tagEl || !validated) return;
+  if (!sourceDuration) {
+    tagEl.textContent = "完成予定尺: 音源読込後に計算";
+    return;
+  }
+  const cuts = validated.operations.filter((o) => o.type === "cut").sort((a, b) => a.start - b.start);
+  const keep = [];
+  let cur = 0;
+  cuts.forEach((c) => {
+    if (c.start > cur) keep.push([cur, c.start]);
+    cur = c.end;
+  });
+  if (cur < sourceDuration) keep.push([cur, sourceDuration]);
+
+  const effectiveSe = getEffectiveSeEvents(validated.operations);
+  const insertEvents = effectiveSe.filter((ev) => ev.mode === "insert");
+  const introSec = Math.max(0, Math.min(30, Number($("introBgmSec")?.value) || 0));
+  const outroSec = Math.max(0, Math.min(30, Number($("outroBgmSec")?.value) || 0));
+  const { totalOutDuration } = buildTimelineSegments(keep, insertEvents, introSec, outroSec);
+  tagEl.textContent = `完成予定尺: ${fmt(totalOutDuration)}`;
+}
+
 function validate() {
   try {
     validated = parseInstructions();
@@ -887,6 +918,7 @@ function validate() {
     $("validation").textContent = `検証OK：${validated.operations.length}件の操作。時刻は元音源基準です。${suffix}`;
     renderOps();
     renderTimeline();
+    updateEstimatedDurationTag();
     updateTelopStatus();
     $("editCard").hidden = false;
     setActiveStep(3);
@@ -1168,25 +1200,29 @@ function scheduleBgmSegments({
   sceneTransitions,
   autoSwitch,
   thresholdSec,
-  crossfadeSec
+  crossfadeSec,
+  startTrackOffset = 0
 }) {
   const totalWin = winEnd - winStart;
-  if (totalWin <= 0.05 || !tracks.length) return [];
+  if (totalWin <= 0.05 || !tracks.length) return { segments: [], nextTrackOffset: startTrackOffset };
 
   if (tracks.length === 1 || !autoSwitch) {
-    return [{
-      trackIndex: 0,
-      outStart: winStart,
-      outEnd: winEnd,
-      fadeIn: Math.min(fadeIn, totalWin),
-      fadeOut: Math.min(fadeOut, totalWin),
-      baseVolume
-    }];
+    return {
+      segments: [{
+        trackIndex: startTrackOffset % tracks.length,
+        outStart: winStart,
+        outEnd: winEnd,
+        fadeIn: Math.min(fadeIn, totalWin),
+        fadeOut: Math.min(fadeOut, totalWin),
+        baseVolume
+      }],
+      nextTrackOffset: startTrackOffset
+    };
   }
 
   const scheduled = [];
   let curTime = winStart;
-  let trackIdx = 0;
+  let trackIdx = startTrackOffset;
   let safetyCounter = 0;
 
   while (curTime < winEnd - 0.05 && safetyCounter < 200) {
@@ -1257,10 +1293,11 @@ function scheduleBgmSegments({
       fadeOut: Math.min(fadeOut, finalDur),
       baseVolume
     });
+    trackIdx += 1;
     break;
   }
 
-  return scheduled;
+  return { segments: scheduled, nextTrackOffset: trackIdx };
 }
 
 async function getDuration(file) {
@@ -1504,9 +1541,6 @@ function mapSubtitleCuesToOutput(rawSegments, timeline) {
   return cues.sort((a, b) => a.outStart - b.outStart);
 }
 
-/**
- * ブラウザ標準の高速メモリ処理だけで全音声トラック（カット・複数BGM・イントロ/アウトロ・SE・フェード）を合成
- */
 async function mixAudioInMemory({
   duration,
   timeline,
@@ -1562,7 +1596,7 @@ async function mixAudioInMemory({
   }
   srcData = null;
 
-  // 2. BGM合成（複数曲自動切替・イントロ/アウトロ音量ブースト・SE挿入時ミュート対応）
+  // 2. BGM合成（複数区間でも曲順引き継ぎ・イントロ/アウトロ音量ブースト・SE挿入時ミュート対応）
   const effectiveBgmOps = bgmOps.length
     ? bgmOps
     : (bgmTracks.length > 0
@@ -1597,6 +1631,8 @@ async function mixAudioInMemory({
     const duckRamp = Math.max(1, Math.floor(0.012 * sampleRate));
 
     const segsByTrack = new Map();
+    let trackOffset = 0;
+
     for (const op of effectiveBgmOps) {
       const winStart = op.start <= 0.05 ? 0 : mapOriginalToOutput(op.start, timeline, talkEndOut);
       const winEnd = op.end >= duration - 0.05
@@ -1604,7 +1640,7 @@ async function mixAudioInMemory({
         : mapOriginalToOutput(op.end, timeline, talkEndOut);
       if (winEnd - winStart <= 0.05) continue;
 
-      const scheduledSegs = scheduleBgmSegments({
+      const { segments: scheduledSegs, nextTrackOffset } = scheduleBgmSegments({
         winStart,
         winEnd,
         baseVolume: op.volume,
@@ -1614,8 +1650,10 @@ async function mixAudioInMemory({
         sceneTransitions,
         autoSwitch,
         thresholdSec,
-        crossfadeSec
+        crossfadeSec,
+        startTrackOffset: trackOffset
       });
+      trackOffset = nextTrackOffset;
 
       for (const seg of scheduledSegs) {
         if (seg.outEnd - seg.outStart <= 0.05) continue;
@@ -1727,14 +1765,19 @@ async function mixAudioInMemory({
     seData = null;
   }
 
-  // 4. 全体フェード処理
+  // 4. 全体・区間フェード処理
   if (fades.length) {
     editProgress(40, "フェードを適用中…");
     for (const o of fades) {
       const d = Math.max(0.01, o.end - o.start);
-      const st = o.effect === "out"
-        ? Math.max(0, totalOutDuration - d)
-        : (o.start <= 0.05 ? 0 : mapOriginalToOutput(o.start, timeline, talkEndOut));
+      let st;
+      if (o.effect === "out" && o.end >= duration - 0.1) {
+        st = Math.max(0, totalOutDuration - d);
+      } else if (o.effect === "in" && o.start <= 0.05) {
+        st = 0;
+      } else {
+        st = mapOriginalToOutput(o.start, timeline, talkEndOut);
+      }
       const fStart = Math.max(0, Math.floor(st * sampleRate));
       const fEnd = Math.min(totalSamples, Math.floor((st + d) * sampleRate));
       const fLen = Math.max(1, fEnd - fStart);
@@ -1806,7 +1849,7 @@ async function render() {
 
   resetWorker();
 
-  const profile = getDeviceProfile();
+  const profile = getDeviceProfile(duration);
   const sampleRate = format === "wav" ? 44100 : profile.sampleRate;
   const introSec = Math.max(0, Math.min(30, Number($("introBgmSec")?.value) || 0));
   const outroSec = Math.max(0, Math.min(30, Number($("outroBgmSec")?.value) || 0));
@@ -1818,7 +1861,7 @@ async function render() {
   const { timeline, totalOutDuration, talkEndOut } = buildTimelineSegments(keep, insertSeEvents, introSec, outroSec);
 
   // STEP 1: ブラウザ標準の高速メモリ処理で全音声を合成
-  const { outL, outR } = await mixAudioInMemory({
+  let mixed = await mixAudioInMemory({
     duration,
     timeline,
     totalOutDuration,
@@ -1835,7 +1878,8 @@ async function render() {
   });
 
   editProgress(44, "完成音声データを生成中…");
-  let wavBytes = encodeStereoWav(outL, outR, sampleRate);
+  let wavBytes = encodeStereoWav(mixed.outL, mixed.outR, sampleRate);
+  mixed = null;
 
   if (format === "wav") {
     const blob = new Blob([wavBytes], { type: "audio/wav" });
@@ -1935,6 +1979,10 @@ async function render() {
 
     const cueFiles = [];
     for (let i = 0; i < mappedCues.length; i++) {
+      if (i % 15 === 0) {
+        const subPct = 63 + Math.min(4, Math.round((i / Math.max(1, mappedCues.length)) * 4));
+        editProgress(subPct, "テロップ画像を生成中…", `${i + 1}/${mappedCues.length}枚`);
+      }
       workCtx.clearRect(0, 0, w, h);
       workCtx.drawImage(baseCanvas, 0, 0);
       drawTelopOnCanvas(workCtx, w, h, mappedCues[i].text, { sizeKey, styleKey, posKey });
@@ -1985,8 +2033,8 @@ async function render() {
 
     await f.writeFile("frames.txt", concatLines.join("\n"));
 
-    ffProgressRange = { start: 67, span: 27, label: "MP4動画をエンコード中…" };
-    editProgress(67, "MP4動画をエンコード中…");
+    ffProgressRange = { start: 68, span: 26, label: "MP4動画をエンコード中…" };
+    editProgress(68, "MP4動画をエンコード中…");
     await execFF(f, [
       "-y",
       "-f", "concat",
