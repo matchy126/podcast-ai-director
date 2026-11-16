@@ -1,13 +1,16 @@
-// FFmpeg modules are loaded dynamically inside loadFF() so UI handlers always bind immediately.
+// Podcast AI Director v0.8.1
+// Lightweight WebAudio Mixing + FFmpeg Single-Pass Mux (Multi-BGM, Intro/Outro Solo Boost, MP4 Telop)
 
 const $ = (id) => document.getElementById(id);
 
 let source = null;
 let segments = [];
+let externalTelopSegments = null;
 let ff = null;
 let ffLoadPromise = null;
+let ffLogs = [];
 let validated = null;
-let bgm = null;
+let bgmTracks = []; // [{ id, file, name, duration }]
 let se = null;
 let seDuration = null;
 let thumbnail = null;
@@ -17,6 +20,12 @@ let outputUrl = null;
 let sourceUrl = null;
 let activeWorker = null;
 let elapsedTimer = null;
+
+let ffProgressRange = {
+  start: 65,
+  span: 30,
+  label: "エンコード中…"
+};
 
 function formatError(err) {
   if (!err) return "不明なエラーが発生しました。";
@@ -29,6 +38,28 @@ function formatError(err) {
   } catch {
     return String(err);
   }
+}
+
+function getDeviceProfile() {
+  const rawMem = Number(navigator.deviceMemory);
+  const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent || "");
+  const isLowMem = Number.isFinite(rawMem) && rawMem <= 4;
+  if (isMobile || isLowMem) {
+    return {
+      label: "省メモリモード",
+      sampleRate: 32000,
+      videoWidth: 854,
+      videoHeight: 480,
+      crf: "25"
+    };
+  }
+  return {
+    label: "標準軽量モード",
+    sampleRate: 44100,
+    videoWidth: 1280,
+    videoHeight: 720,
+    crf: "23"
+  };
 }
 
 const fmt = (s) => {
@@ -92,6 +123,17 @@ function bindFileInput(el, onFile) {
   });
 }
 
+function bindMultiFileInput(el, onFiles) {
+  if (!el) return;
+  el.addEventListener("click", () => {
+    el.value = "";
+  });
+  el.addEventListener("change", (e) => {
+    const files = Array.from(e.target.files || []);
+    if (files.length) onFiles(files);
+  });
+}
+
 bindFileInput($("audio"), (file) => setAudio(file));
 
 function updateSkipTranscribeState() {
@@ -121,8 +163,9 @@ function updateExecuteButtonState() {
     execBtn.disabled = true;
     execBtn.textContent = "STEP 01 で収録音源を選択すると編集を実行できます";
   } else {
+    const profile = getDeviceProfile();
     execBtn.disabled = false;
-    execBtn.textContent = "編集を実行";
+    execBtn.textContent = `編集を実行（${profile.label}）`;
   }
 }
 
@@ -170,10 +213,143 @@ dropEl.ondrop = (e) => {
   setAudio(e.dataTransfer.files[0]);
 };
 
-bindFileInput($("bgm"), (file) => {
-  bgm = file;
-  $("bgmName").textContent = `選択中：${bgm.name}`;
+// --- Multi-BGM Playlist Management ---
+async function addBgmFiles(files, replace = false) {
+  const entries = [];
+  for (const file of files) {
+    let dur = null;
+    try {
+      dur = await getDuration(file);
+    } catch {
+      dur = null;
+    }
+    entries.push({
+      id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      file,
+      name: file.name,
+      duration: Number.isFinite(dur) && dur > 0 ? dur : null
+    });
+  }
+  bgmTracks = replace ? entries : [...bgmTracks, ...entries];
+  renderBgmPlaylist();
   if (validated) validate();
+}
+
+function renderBgmPlaylist() {
+  const nameEl = $("bgmName");
+  const listEl = $("bgmPlaylist");
+  const clearBtn = $("bgmClear");
+  const multiOpts = $("multiBgmOptions");
+
+  if (!bgmTracks.length) {
+    nameEl.textContent = "BGM未選択";
+    listEl.hidden = true;
+    listEl.innerHTML = "";
+    clearBtn.hidden = true;
+    multiOpts.hidden = true;
+    return;
+  }
+
+  clearBtn.hidden = false;
+  multiOpts.hidden = bgmTracks.length < 2;
+  nameEl.textContent = bgmTracks.length === 1
+    ? `選択中：${bgmTracks[0].name}${bgmTracks[0].duration ? `（${fmt(bgmTracks[0].duration)}）` : ""}`
+    : `選択中：${bgmTracks.length}曲のBGMプレイリスト`;
+
+  listEl.hidden = false;
+  listEl.innerHTML = "";
+  bgmTracks.forEach((tr, idx) => {
+    const row = document.createElement("div");
+    row.className = "playlist-item";
+
+    const info = document.createElement("div");
+    info.className = "playlist-item-info";
+    const badge = document.createElement("span");
+    badge.className = "playlist-badge";
+    badge.textContent = String(idx + 1);
+    const title = document.createElement("span");
+    title.className = "playlist-title";
+    title.textContent = tr.name;
+    title.title = tr.name;
+    const dur = document.createElement("span");
+    dur.className = "playlist-dur";
+    dur.textContent = tr.duration ? fmt(tr.duration) : "--:--";
+    info.append(badge, title, dur);
+
+    const actions = document.createElement("div");
+    actions.className = "playlist-actions";
+
+    const upBtn = document.createElement("button");
+    upBtn.type = "button";
+    upBtn.className = "icon-btn";
+    upBtn.textContent = "↑";
+    upBtn.title = "上へ移動";
+    upBtn.disabled = idx === 0;
+    upBtn.onclick = () => {
+      if (idx === 0) return;
+      [bgmTracks[idx - 1], bgmTracks[idx]] = [bgmTracks[idx], bgmTracks[idx - 1]];
+      renderBgmPlaylist();
+      if (validated) validate();
+    };
+
+    const downBtn = document.createElement("button");
+    downBtn.type = "button";
+    downBtn.className = "icon-btn";
+    downBtn.textContent = "↓";
+    downBtn.title = "下へ移動";
+    downBtn.disabled = idx === bgmTracks.length - 1;
+    downBtn.onclick = () => {
+      if (idx >= bgmTracks.length - 1) return;
+      [bgmTracks[idx + 1], bgmTracks[idx]] = [bgmTracks[idx], bgmTracks[idx + 1]];
+      renderBgmPlaylist();
+      if (validated) validate();
+    };
+
+    const delBtn = document.createElement("button");
+    delBtn.type = "button";
+    delBtn.className = "icon-btn";
+    delBtn.textContent = "✕";
+    delBtn.title = "削除";
+    delBtn.onclick = () => {
+      bgmTracks.splice(idx, 1);
+      renderBgmPlaylist();
+      if (validated) validate();
+    };
+
+    actions.append(upBtn, downBtn, delBtn);
+    row.append(info, actions);
+    listEl.append(row);
+  });
+
+  if (bgmTracks.length >= 2) {
+    const note = document.createElement("div");
+    note.className = "playlist-note";
+    if ($("bgmAutoSwitch")?.checked) {
+      const th = Math.max(5, Number($("bgmSwitchThreshold")?.value) || 20);
+      const xf = Math.max(0, Number($("bgmCrossfadeSec")?.value) || 1.5);
+      note.textContent = `✓ 自動切替ON：各曲の残り${th}秒以下になった後の最初の場面切り替えで次の曲へ（クロスフェード ${xf}秒）`;
+    } else {
+      note.textContent = "自動切替OFF：1曲目をループ再生します";
+    }
+    listEl.append(note);
+  }
+}
+
+bindMultiFileInput($("bgm"), (files) => addBgmFiles(files, true));
+bindMultiFileInput($("bgmAdd"), (files) => addBgmFiles(files, false));
+$("bgmClear").onclick = () => {
+  bgmTracks = [];
+  renderBgmPlaylist();
+  if (validated) validate();
+};
+
+["introBgmSec", "outroBgmSec", "boostBgmOnSolo", "bgmAutoSwitch", "bgmSwitchThreshold", "bgmCrossfadeSec"].forEach((id) => {
+  const el = $(id);
+  if (!el) return;
+  el.addEventListener("change", () => {
+    renderBgmPlaylist();
+    if (validated) validate();
+  });
 });
 
 bindFileInput($("se"), async (file) => {
@@ -229,6 +405,119 @@ bindFileInput($("thumbnail"), (file) => {
   if (validated) validate();
 });
 
+// --- Telop / Subtitle Management ---
+function getActiveTelopSegments() {
+  if (Array.isArray(externalTelopSegments) && externalTelopSegments.length > 0) {
+    return externalTelopSegments;
+  }
+  if (Array.isArray(segments) && segments.length > 0) {
+    return segments;
+  }
+  return [];
+}
+
+function updateTelopStatus() {
+  const statusEl = $("telopStatus");
+  if (!statusEl) return;
+  const activeSegs = getActiveTelopSegments();
+  if (activeSegs.length > 0) {
+    const srcLabel = externalTelopSegments?.length ? "読込ファイル" : "STEP 01文字起こし";
+    statusEl.className = "ok";
+    statusEl.textContent = `✓ ${srcLabel}の字幕データ（${activeSegs.length}件）を使用します`;
+  } else {
+    statusEl.className = "";
+    statusEl.textContent = "字幕データ未読込：STEP 01で文字起こしを実行するか、上のボタンからJSON/TXT/SRTを読み込んでください";
+  }
+}
+
+function parseTimeToken(tok) {
+  const clean = String(tok || "").trim().replace(",", ".");
+  const parts = clean.split(":").map(Number);
+  if (parts.some((n) => !Number.isFinite(n))) return NaN;
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  if (parts.length === 1) return parts[0];
+  return NaN;
+}
+
+function parseTelopText(rawText) {
+  const trimmed = String(rawText || "").trim();
+  if (!trimmed) throw new Error("字幕ファイルが空です。");
+
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    const parsed = JSON.parse(trimmed);
+    const list = Array.isArray(parsed) ? parsed : parsed?.segments;
+    if (!Array.isArray(list)) throw new Error("JSON内に segments 配列が見つかりません。");
+    const out = list
+      .map((item) => ({
+        start: Number(item.start),
+        end: Number(item.end),
+        text: String(item.text || "").trim()
+      }))
+      .filter((s) => Number.isFinite(s.start) && Number.isFinite(s.end) && s.end > s.start && s.text);
+    if (!out.length) throw new Error("有効なタイムスタンプ付き字幕が見つかりません。");
+    return out;
+  }
+
+  if (trimmed.includes("-->")) {
+    const blocks = trimmed.split(/\r?\n\r?\n+/);
+    const out = [];
+    for (const blk of blocks) {
+      const lines = blk.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      const timeLineIdx = lines.findIndex((l) => l.includes("-->"));
+      if (timeLineIdx === -1) continue;
+      const [lhs, rhs] = lines[timeLineIdx].split("-->");
+      const start = parseTimeToken(lhs);
+      const end = parseTimeToken((rhs || "").trim().split(/\s+/)[0]);
+      const text = lines.slice(timeLineIdx + 1).join(" ").trim();
+      if (Number.isFinite(start) && Number.isFinite(end) && end > start && text) {
+        out.push({ start, end, text });
+      }
+    }
+    if (!out.length) throw new Error("SRTファイルから有効な字幕を抽出できませんでした。");
+    return out;
+  }
+
+  const out = [];
+  const lineRe = /^\[([0-9:.]+)\s*[-–—]\s*([0-9:.]+)\]\s*(.+)$/;
+  for (const rawLine of trimmed.split(/\r?\n/)) {
+    const m = rawLine.trim().match(lineRe);
+    if (!m) continue;
+    const start = parseTimeToken(m[1]);
+    const end = parseTimeToken(m[2]);
+    const text = m[3].trim();
+    if (Number.isFinite(start) && Number.isFinite(end) && end > start && text) {
+      out.push({ start, end, text });
+    }
+  }
+  if (!out.length) {
+    throw new Error("対応形式（transcript.json / [00:00.0 - 00:05.0] 形式のTXT / SRT）として読み取れませんでした。");
+  }
+  return out;
+}
+
+$("enableTelop").onchange = () => {
+  const enabled = $("enableTelop").checked;
+  $("telopOptions").hidden = !enabled;
+  if (enabled && $("format").value !== "mp4") {
+    $("format").value = "mp4";
+    updateFormatUi();
+  }
+  updateTelopStatus();
+  if (validated) validate();
+};
+
+bindFileInput($("telopFile"), async (file) => {
+  try {
+    const text = await file.text();
+    externalTelopSegments = parseTelopText(text);
+    updateTelopStatus();
+    if (validated) validate();
+  } catch (err) {
+    alert("字幕ファイルの読み込みに失敗しました: " + formatError(err));
+  }
+});
+
 async function decodeAudioTo16kMono(file) {
   const AudioCtx = window.AudioContext || window.webkitAudioContext;
   if (!AudioCtx) {
@@ -263,7 +552,7 @@ async function decodeAudioTo16kMono(file) {
 
 function getWorker() {
   if (!activeWorker) {
-    activeWorker = new Worker("./transcribe-worker.js?v=0.7.1", { type: "module" });
+    activeWorker = new Worker("./transcribe-worker.js?v=0.8.1", { type: "module" });
   }
   return activeWorker;
 }
@@ -364,6 +653,7 @@ $("transcribe").onclick = async () => {
     $("transcriptArea").hidden = false;
     $("jsonHeading").classList.add("subheading");
     $("toggleTranscriptBtn").textContent = "文字起こし欄を隠す";
+    updateTelopStatus();
     setActiveStep(2);
     $("transcriptCard").scrollIntoView({ behavior: "smooth" });
   } catch (e) {
@@ -561,15 +851,29 @@ function validate() {
       notes.push(`SE挿入 ${insertCount}箇所（後ろの音声を押し出し）`);
     }
 
+    const introSec = Math.max(0, Number($("introBgmSec")?.value) || 0);
+    const outroSec = Math.max(0, Number($("outroBgmSec")?.value) || 0);
+    if (introSec > 0 || outroSec > 0) {
+      notes.push(`BGMオンリー 冒頭${introSec}s / 終了${outroSec}s`);
+    }
+
     const hasBgm = validated.operations.some((o) => o.type === "bgm");
-    if (hasBgm && !bgm) notes.push("BGM指示あり：STEP 04でBGMファイルを選択してください");
+    if (hasBgm && !bgmTracks.length) {
+      notes.push("BGM指示あり：STEP 04でBGMファイルを選択してください");
+    } else if (bgmTracks.length >= 2) {
+      notes.push(`BGM ${bgmTracks.length}曲プレイリスト`);
+    }
 
     if (effectiveSe.length > 0 && !se) {
       notes.push("SE指示あり：STEP 04で場面切り替えSEファイルを選択してください");
     }
 
-    if ($("format").value === "mp4" && !thumbnail) {
-      notes.push("MP4出力：サムネイル未選択のため単色背景で生成します");
+    if ($("format").value === "mp4") {
+      if (!thumbnail) notes.push("MP4出力：サムネイル未選択のため単色背景で生成します");
+      if ($("enableTelop")?.checked) {
+        const cueCount = getActiveTelopSegments().length;
+        notes.push(cueCount > 0 ? `テロップON（${cueCount}件）` : "テロップON（字幕データ未読込）");
+      }
     }
 
     if (!source) {
@@ -583,6 +887,7 @@ function validate() {
     $("validation").textContent = `検証OK：${validated.operations.length}件の操作。時刻は元音源基準です。${suffix}`;
     renderOps();
     renderTimeline();
+    updateTelopStatus();
     $("editCard").hidden = false;
     setActiveStep(3);
     updateSkipTranscribeState();
@@ -697,29 +1002,49 @@ function renderTimeline() {
   $("timelineScale").innerHTML = `<span>00:00</span><span>${fmt(duration / 2)}</span><span>${fmt(duration)}</span>`;
 }
 
+function resetFF() {
+  if (ff) {
+    try {
+      ff.terminate();
+    } catch {
+      // Ignore
+    }
+  }
+  ff = null;
+  ffLoadPromise = null;
+  ffLogs = [];
+}
+
 async function loadFF() {
   if (ff && ff.loaded) return ff;
   if (ffLoadPromise) return ffLoadPromise;
 
   ffLoadPromise = (async () => {
-    editProgress(4, "編集ライブラリを読み込み中…", "@ffmpeg/ffmpeg");
-    const [{ FFmpeg }, { fetchFile, toBlobURL }] = await Promise.all([
+    editProgress(46, "変換エンジンを読み込み中…", "@ffmpeg/ffmpeg");
+    const [{ FFmpeg }, { toBlobURL }] = await Promise.all([
       import("https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/index.js"),
       import("https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/dist/esm/index.js")
     ]);
     const instance = new FFmpeg();
+    ffLogs = [];
+    instance.on("log", ({ message }) => {
+      if (!message) return;
+      ffLogs.push(message);
+      if (ffLogs.length > 30) ffLogs.shift();
+    });
     instance.on("progress", ({ progress: p }) => {
       const ratio = Number.isFinite(p) ? Math.min(1, Math.max(0, p)) : 0;
-      editProgress(45 + Math.round(ratio * 45), "メディアをレンダリング中…", `${Math.round(ratio * 100)}%`);
+      const pct = Math.min(95, Math.round(ffProgressRange.start + ratio * ffProgressRange.span));
+      editProgress(pct, ffProgressRange.label, `${Math.round(ratio * 100)}%`);
     });
     const base = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm";
     const workerCode = 'import "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/worker.js";';
     const classWorkerURL = URL.createObjectURL(new Blob([workerCode], { type: "text/javascript" }));
-    editProgress(8, "FFmpegコアをダウンロード中…", "初回のみエンジンを取得します");
+    editProgress(50, "FFmpegコアをダウンロード中…", "初回のみエンジンを取得します");
     const coreURL = await toBlobURL(base + "/ffmpeg-core.js", "text/javascript");
-    editProgress(22, "FFmpeg WASMをダウンロード中…", "ffmpeg-core.wasm");
+    editProgress(55, "FFmpeg WASMをダウンロード中…", "ffmpeg-core.wasm");
     const wasmURL = await toBlobURL(base + "/ffmpeg-core.wasm", "application/wasm");
-    editProgress(35, "FFmpegエンジンを初期化中…", "");
+    editProgress(60, "FFmpegエンジンを初期化中…", "");
     await instance.load({ classWorkerURL, coreURL, wasmURL });
     URL.revokeObjectURL(classWorkerURL);
     if (!instance.loaded) {
@@ -732,20 +1057,34 @@ async function loadFF() {
   try {
     return await ffLoadPromise;
   } catch (err) {
-    ff = null;
-    ffLoadPromise = null;
+    resetFF();
     throw new Error(formatError(err));
   }
 }
 
-/**
- * keep区間 と insert SE イベントから、出力タイムライン（source区間 / insert無音区間）を構築する
- */
-function buildTimelineSegments(keep, insertEvents) {
+async function execFF(f, args) {
+  ffLogs = [];
+  const exitCode = await f.exec(args);
+  if (exitCode !== 0) {
+    const recentLogs = ffLogs
+      .filter((line) => /error|invalid|failed|cannot|no such|unable|not found|out of memory/i.test(line))
+      .slice(-4);
+    const fallbackLogs = ffLogs.slice(-4);
+    const detail = (recentLogs.length ? recentLogs : fallbackLogs).join(" / ");
+    throw new Error(`変換エンジンエラー (code=${exitCode})${detail ? `: ${detail}` : ""}`);
+  }
+}
+
+function buildTimelineSegments(keep, insertEvents, introSec = 0, outroSec = 0) {
   const sortedInserts = [...insertEvents].sort((a, b) => a.time - b.time);
   const usedInsertIndices = new Set();
   const timeline = [];
   let outCursor = 0;
+
+  if (introSec > 0.01) {
+    timeline.push({ kind: "intro", outStart: 0, outEnd: introSec });
+    outCursor += introSec;
+  }
 
   for (let kIdx = 0; kIdx < keep.length; kIdx++) {
     const [ks, ke] = keep[kIdx];
@@ -797,10 +1136,17 @@ function buildTimelineSegments(keep, insertEvents) {
     }
   }
 
-  return { timeline, totalOutDuration: outCursor };
+  const talkEndOut = outCursor;
+
+  if (outroSec > 0.01) {
+    timeline.push({ kind: "outro", outStart: outCursor, outEnd: outCursor + outroSec });
+    outCursor += outroSec;
+  }
+
+  return { timeline, totalOutDuration: outCursor, talkEndOut };
 }
 
-function mapOriginalToOutput(origTime, timeline, totalOutDuration) {
+function mapOriginalToOutput(origTime, timeline, talkEndOut) {
   for (const seg of timeline) {
     if (seg.kind === "source") {
       if (origTime <= seg.origStart) return seg.outStart;
@@ -809,7 +1155,112 @@ function mapOriginalToOutput(origTime, timeline, totalOutDuration) {
       if (origTime <= seg.origTime) return seg.outEnd;
     }
   }
-  return totalOutDuration;
+  return talkEndOut;
+}
+
+function scheduleBgmSegments({
+  winStart,
+  winEnd,
+  baseVolume,
+  fadeIn,
+  fadeOut,
+  tracks,
+  sceneTransitions,
+  autoSwitch,
+  thresholdSec,
+  crossfadeSec
+}) {
+  const totalWin = winEnd - winStart;
+  if (totalWin <= 0.05 || !tracks.length) return [];
+
+  if (tracks.length === 1 || !autoSwitch) {
+    return [{
+      trackIndex: 0,
+      outStart: winStart,
+      outEnd: winEnd,
+      fadeIn: Math.min(fadeIn, totalWin),
+      fadeOut: Math.min(fadeOut, totalWin),
+      baseVolume
+    }];
+  }
+
+  const scheduled = [];
+  let curTime = winStart;
+  let trackIdx = 0;
+  let safetyCounter = 0;
+
+  while (curTime < winEnd - 0.05 && safetyCounter < 200) {
+    safetyCounter += 1;
+    const tIndex = trackIdx % tracks.length;
+    const track = tracks[tIndex];
+    const trackDur = Number.isFinite(track.duration) && track.duration > 3 ? track.duration : 180;
+    const naturalEnd = curTime + trackDur;
+    const earliestSwitch = Math.max(curTime + 4, naturalEnd - thresholdSec);
+
+    const transition = sceneTransitions.find(
+      (tr) => tr.start >= earliestSwitch && tr.start < winEnd - 1.0 && tr.start > curTime + 2.0
+    );
+
+    if (transition) {
+      const isInsert = transition.end > transition.start + 0.01;
+      const segEnd = isInsert
+        ? transition.start
+        : Math.min(winEnd, transition.start + crossfadeSec * 0.5);
+      const nextStart = isInsert
+        ? transition.end
+        : Math.max(curTime + 0.5, transition.start - crossfadeSec * 0.5);
+
+      const segDur = segEnd - curTime;
+      if (segDur > 0.1) {
+        const isFirst = scheduled.length === 0;
+        const outFade = isInsert
+          ? Math.min(0.6, segDur * 0.35)
+          : Math.min(crossfadeSec, segDur * 0.45);
+        scheduled.push({
+          trackIndex: tIndex,
+          outStart: curTime,
+          outEnd: segEnd,
+          fadeIn: isFirst ? Math.min(fadeIn, segDur) : Math.min(crossfadeSec, segDur * 0.45),
+          fadeOut: outFade,
+          baseVolume
+        });
+      }
+      curTime = nextStart;
+      trackIdx += 1;
+      continue;
+    }
+
+    if (naturalEnd < winEnd - 1.0) {
+      const segDur = naturalEnd - curTime;
+      const isFirst = scheduled.length === 0;
+      const xf = Math.min(crossfadeSec, segDur * 0.4, (winEnd - naturalEnd) * 0.4);
+      scheduled.push({
+        trackIndex: tIndex,
+        outStart: curTime,
+        outEnd: naturalEnd,
+        fadeIn: isFirst ? Math.min(fadeIn, segDur) : xf,
+        fadeOut: xf,
+        baseVolume
+      });
+      curTime = Math.max(curTime + 0.5, naturalEnd - xf);
+      trackIdx += 1;
+      continue;
+    }
+
+    const finalDur = winEnd - curTime;
+    const isFirst = scheduled.length === 0;
+    scheduled.push({
+      trackIndex: tIndex,
+      outStart: curTime,
+      outEnd: winEnd,
+      fadeIn: isFirst ? Math.min(fadeIn, finalDur) : Math.min(crossfadeSec, finalDur * 0.45),
+      fadeOut: Math.min(fadeOut, finalDur),
+      baseVolume
+    });
+    break;
+  }
+
+  return scheduled;
 }
 
 async function getDuration(file) {
@@ -828,11 +1279,493 @@ async function getDuration(file) {
   });
 }
 
+async function decodeFileToStereo(file, targetSampleRate) {
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  if (!AudioCtx) {
+    throw new Error("このブラウザはAudioContextに対応していません。");
+  }
+  let arrayBuffer = await file.arrayBuffer();
+  const ctx = new AudioCtx();
+  let decoded;
+  try {
+    decoded = await ctx.decodeAudioData(arrayBuffer);
+  } finally {
+    arrayBuffer = null;
+    await ctx.close().catch(() => {});
+  }
+
+  const duration = decoded.duration;
+  if (decoded.sampleRate === targetSampleRate) {
+    const left = new Float32Array(decoded.getChannelData(0));
+    const right = decoded.numberOfChannels > 1
+      ? new Float32Array(decoded.getChannelData(1))
+      : new Float32Array(left);
+    decoded = null;
+    return { left, right, duration, sampleRate: targetSampleRate };
+  }
+
+  const targetLength = Math.max(1, Math.ceil(duration * targetSampleRate));
+  const offline = new OfflineAudioContext(2, targetLength, targetSampleRate);
+  const srcNode = offline.createBufferSource();
+  srcNode.buffer = decoded;
+  srcNode.connect(offline.destination);
+  srcNode.start(0);
+  const rendered = await offline.startRendering();
+  const left = new Float32Array(rendered.getChannelData(0));
+  const right = new Float32Array(rendered.getChannelData(1));
+  decoded = null;
+  return { left, right, duration, sampleRate: targetSampleRate };
+}
+
+function encodeStereoWav(left, right, sampleRate) {
+  const numSamples = left.length;
+  const bytesPerSample = 2;
+  const numChannels = 2;
+  const blockAlign = numChannels * bytesPerSample;
+  const byteRate = sampleRate * blockAlign;
+  const dataSize = numSamples * blockAlign;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  const writeStr = (offset, str) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+
+  writeStr(0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeStr(8, "WAVE");
+  writeStr(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, "data");
+  view.setUint32(40, dataSize, true);
+
+  let offset = 44;
+  for (let i = 0; i < numSamples; i++) {
+    const l = Math.max(-1, Math.min(1, left[i]));
+    const r = Math.max(-1, Math.min(1, right[i]));
+    view.setInt16(offset, l < 0 ? l * 0x8000 : l * 0x7fff, true);
+    view.setInt16(offset + 2, r < 0 ? r * 0x8000 : r * 0x7fff, true);
+    offset += 4;
+  }
+
+  return new Uint8Array(buffer);
+}
+
+// --- Lightweight JPEG + Telop Frame Rendering ---
+function wrapSubtitleLines(ctx, text, maxWidth) {
+  const chars = Array.from(text.replace(/\s+/g, " ").trim());
+  const lines = [];
+  let current = "";
+
+  for (const ch of chars) {
+    const test = current + ch;
+    if (ctx.measureText(test).width > maxWidth && current.length > 0) {
+      lines.push(current);
+      current = ch;
+      if (lines.length >= 2) break;
+    } else {
+      current = test;
+    }
+  }
+  if (current && lines.length < 2) {
+    lines.push(current);
+  } else if (current && lines.length === 2) {
+    lines[1] = lines[1].slice(0, Math.max(1, lines[1].length - 1)) + "…";
+  }
+  return lines;
+}
+
+function drawTelopOnCanvas(ctx, width, height, text, { sizeKey, styleKey, posKey }) {
+  const scaleRatio = width / 1280;
+  const baseFontSize = sizeKey === "small" ? 30 : sizeKey === "large" ? 46 : 38;
+  const fontSize = Math.max(16, Math.round(baseFontSize * scaleRatio));
+  ctx.font = `700 ${fontSize}px "Hiragino Kaku Gothic ProN", "Yu Gothic", "Meiryo", "Noto Sans JP", sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  const lines = wrapSubtitleLines(ctx, text, width - Math.round(140 * scaleRatio));
+  if (!lines.length) return;
+
+  const lineHeight = Math.round(fontSize * 1.34);
+  const totalTextH = lines.length * lineHeight;
+  const maxLineW = Math.max(...lines.map((l) => ctx.measureText(l).width));
+  const centerY = posKey === "top"
+    ? Math.round(height * 0.14)
+    : posKey === "center"
+      ? Math.round(height * 0.50)
+      : Math.round(height * 0.84);
+
+  if (styleKey === "band") {
+    const padX = Math.round(28 * scaleRatio);
+    const padY = Math.round(14 * scaleRatio);
+    const boxW = Math.min(width - Math.round(64 * scaleRatio), maxLineW + padX * 2);
+    const boxH = totalTextH + padY * 2;
+    const boxX = (width - boxW) / 2;
+    const boxY = centerY - boxH / 2;
+    const r = Math.round(12 * scaleRatio);
+
+    ctx.fillStyle = "rgba(8, 13, 26, 0.80)";
+    ctx.beginPath();
+    ctx.moveTo(boxX + r, boxY);
+    ctx.lineTo(boxX + boxW - r, boxY);
+    ctx.quadraticCurveTo(boxX + boxW, boxY, boxX + boxW, boxY + r);
+    ctx.lineTo(boxX + boxW, boxY + boxH - r);
+    ctx.quadraticCurveTo(boxX + boxW, boxY + boxH, boxX + boxW - r, boxY + boxH);
+    ctx.lineTo(boxX + r, boxY + boxH);
+    ctx.quadraticCurveTo(boxX, boxY + boxH, boxX, boxY + boxH - r);
+    ctx.lineTo(boxX, boxY + r);
+    ctx.quadraticCurveTo(boxX, boxY, boxX + r, boxY);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.18)";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+
+  const startY = centerY - ((lines.length - 1) * lineHeight) / 2;
+  lines.forEach((line, idx) => {
+    const y = startY + idx * lineHeight;
+    if (styleKey === "outline" || styleKey === "yellow") {
+      ctx.lineJoin = "round";
+      ctx.lineWidth = Math.max(3, Math.round(fontSize * 0.22));
+      ctx.strokeStyle = "rgba(0, 0, 0, 0.92)";
+      ctx.strokeText(line, width / 2, y);
+    }
+    ctx.fillStyle = styleKey === "yellow" ? "#fde047" : "#ffffff";
+    ctx.fillText(line, width / 2, y);
+  });
+}
+
+async function createBaseCanvas(thumbnailFile, width, height) {
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#0b1120";
+  ctx.fillRect(0, 0, width, height);
+
+  if (thumbnailFile) {
+    const imgUrl = URL.createObjectURL(thumbnailFile);
+    try {
+      const img = await new Promise((resolve, reject) => {
+        const el = new Image();
+        el.onload = () => resolve(el);
+        el.onerror = () => reject(new Error("サムネイル画像のデコードに失敗しました。"));
+        el.src = imgUrl;
+      });
+      const scale = Math.min(width / img.naturalWidth, height / img.naturalHeight);
+      const drawW = Math.round(img.naturalWidth * scale);
+      const drawH = Math.round(img.naturalHeight * scale);
+      const drawX = Math.round((width - drawW) / 2);
+      const drawY = Math.round((height - drawH) / 2);
+      ctx.drawImage(img, drawX, drawY, drawW, drawH);
+    } finally {
+      URL.revokeObjectURL(imgUrl);
+    }
+  }
+  return canvas;
+}
+
+async function canvasToJpegBytes(canvas, quality = 0.84) {
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
+  const buf = await blob.arrayBuffer();
+  return new Uint8Array(buf);
+}
+
+function mapSubtitleCuesToOutput(rawSegments, timeline) {
+  const sourcePieces = timeline.filter((seg) => seg.kind === "source");
+  const cues = [];
+
+  for (const seg of rawSegments) {
+    const text = String(seg.text || "").trim();
+    if (!text) continue;
+    for (const piece of sourcePieces) {
+      const ovStart = Math.max(seg.start, piece.origStart);
+      const ovEnd = Math.min(seg.end, piece.origEnd);
+      if (ovEnd > ovStart + 0.05) {
+        cues.push({
+          outStart: piece.outStart + (ovStart - piece.origStart),
+          outEnd: piece.outStart + (ovEnd - piece.origStart),
+          text
+        });
+      }
+    }
+  }
+
+  return cues.sort((a, b) => a.outStart - b.outStart);
+}
+
+/**
+ * ブラウザ標準の高速メモリ処理だけで全音声トラック（カット・複数BGM・イントロ/アウトロ・SE・フェード）を合成
+ */
+async function mixAudioInMemory({
+  duration,
+  timeline,
+  totalOutDuration,
+  talkEndOut,
+  introSec,
+  outroSec,
+  boostSolo,
+  allSeEvents,
+  bgmOps,
+  insertSeEvents,
+  overlaySeEvents,
+  fades,
+  sampleRate
+}) {
+  const totalSamples = Math.max(1, Math.ceil(totalOutDuration * sampleRate));
+  const outL = new Float32Array(totalSamples);
+  const outR = new Float32Array(totalSamples);
+
+  // 1. 元音源のデコードとカット区間コピー
+  editProgress(8, "元音源をデコード中…");
+  let srcData = await decodeFileToStereo(source, sampleRate);
+  const declickSamples = Math.max(1, Math.floor(0.003 * sampleRate));
+
+  editProgress(16, "カット区間とタイムラインを構築中…");
+  for (const seg of timeline) {
+    if (seg.kind !== "source") continue;
+    const srcStart = Math.max(0, Math.floor(seg.origStart * sampleRate));
+    const srcEnd = Math.min(srcData.left.length, Math.floor(seg.origEnd * sampleRate));
+    const dstStart = Math.max(0, Math.floor(seg.outStart * sampleRate));
+    const copyLen = Math.min(srcEnd - srcStart, totalSamples - dstStart);
+    if (copyLen <= 0) continue;
+
+    outL.set(srcData.left.subarray(srcStart, srcStart + copyLen), dstStart);
+    outR.set(srcData.right.subarray(srcStart, srcStart + copyLen), dstStart);
+
+    const ramp = Math.min(declickSamples, Math.floor(copyLen / 4));
+    if (seg.origStart > 0.01) {
+      for (let j = 0; j < ramp; j++) {
+        const g = j / ramp;
+        outL[dstStart + j] *= g;
+        outR[dstStart + j] *= g;
+      }
+    }
+    if (seg.origEnd < duration - 0.01) {
+      for (let j = 0; j < ramp; j++) {
+        const g = j / ramp;
+        const idx = dstStart + copyLen - 1 - j;
+        outL[idx] *= g;
+        outR[idx] *= g;
+      }
+    }
+  }
+  srcData = null;
+
+  // 2. BGM合成（複数曲自動切替・イントロ/アウトロ音量ブースト・SE挿入時ミュート対応）
+  const effectiveBgmOps = bgmOps.length
+    ? bgmOps
+    : (bgmTracks.length > 0
+        ? [{ start: 0, end: duration, volume: 0.08, fade_in: Math.min(2, introSec || 1.5), fade_out: Math.min(2.5, outroSec || 2.0) }]
+        : []);
+
+  if (effectiveBgmOps.length && bgmTracks.length) {
+    const sceneTransitions = [];
+    for (const seg of timeline) {
+      if (seg.kind === "insert") {
+        sceneTransitions.push({ start: seg.outStart, end: seg.outEnd });
+      }
+    }
+    for (const ev of allSeEvents) {
+      if (ev.mode === "insert") continue;
+      const tOut = mapOriginalToOutput(ev.time, timeline, talkEndOut);
+      if (!sceneTransitions.some((tr) => Math.abs(tr.start - tOut) < 0.25)) {
+        sceneTransitions.push({ start: tOut, end: tOut });
+      }
+    }
+    sceneTransitions.sort((a, b) => a.start - b.start);
+
+    const autoSwitch = $("bgmAutoSwitch")?.checked !== false;
+    const thresholdSec = Math.max(5, Number($("bgmSwitchThreshold")?.value) || 20);
+    const crossfadeSec = Math.max(0, Number($("bgmCrossfadeSec")?.value) || 1.5);
+    const muteOnInsert = $("muteBgmOnInsert")?.checked !== false;
+    const muteRanges = muteOnInsert
+      ? timeline
+          .filter((seg) => seg.kind === "insert")
+          .map((seg) => [Math.floor(seg.outStart * sampleRate), Math.floor(seg.outEnd * sampleRate)])
+      : [];
+    const duckRamp = Math.max(1, Math.floor(0.012 * sampleRate));
+
+    const segsByTrack = new Map();
+    for (const op of effectiveBgmOps) {
+      const winStart = op.start <= 0.05 ? 0 : mapOriginalToOutput(op.start, timeline, talkEndOut);
+      const winEnd = op.end >= duration - 0.05
+        ? totalOutDuration
+        : mapOriginalToOutput(op.end, timeline, talkEndOut);
+      if (winEnd - winStart <= 0.05) continue;
+
+      const scheduledSegs = scheduleBgmSegments({
+        winStart,
+        winEnd,
+        baseVolume: op.volume,
+        fadeIn: Number(op.fade_in || 0),
+        fadeOut: Number(op.fade_out || 0),
+        tracks: bgmTracks,
+        sceneTransitions,
+        autoSwitch,
+        thresholdSec,
+        crossfadeSec
+      });
+
+      for (const seg of scheduledSegs) {
+        if (seg.outEnd - seg.outStart <= 0.05) continue;
+        if (!segsByTrack.has(seg.trackIndex)) segsByTrack.set(seg.trackIndex, []);
+        segsByTrack.get(seg.trackIndex).push(seg);
+      }
+    }
+
+    const activeTrackIndices = Array.from(segsByTrack.keys()).sort((a, b) => a - b);
+    const rampInSec = Math.min(1.2, introSec * 0.45);
+    const rampOutSec = Math.min(1.2, outroSec * 0.45);
+
+    for (let tStep = 0; tStep < activeTrackIndices.length; tStep++) {
+      const tIdx = activeTrackIndices[tStep];
+      const tr = bgmTracks[tIdx];
+      editProgress(
+        22 + Math.round((tStep / Math.max(1, activeTrackIndices.length)) * 12),
+        `BGMを合成中（${tStep + 1}/${activeTrackIndices.length}曲目）…`,
+        tr.name
+      );
+
+      let bgmData = await decodeFileToStereo(tr.file, sampleRate);
+      const bgmLen = Math.max(1, bgmData.left.length);
+
+      for (const seg of segsByTrack.get(tIdx)) {
+        const startIdx = Math.max(0, Math.floor(seg.outStart * sampleRate));
+        const endIdx = Math.min(totalSamples, Math.floor(seg.outEnd * sampleRate));
+        const fadeInSamples = Math.floor(seg.fadeIn * sampleRate);
+        const fadeOutSamples = Math.floor(seg.fadeOut * sampleRate);
+        const baseVol = seg.baseVolume;
+        const soloVol = Math.min(0.45, Math.max(baseVol * 2.2, baseVol + 0.08));
+
+        for (let i = startIdx; i < endIdx; i++) {
+          let muteMult = 1;
+          for (let m = 0; m < muteRanges.length; m++) {
+            const [ms, me] = muteRanges[m];
+            if (i >= ms && i < me) {
+              muteMult = 0;
+              break;
+            }
+            if (i >= ms - duckRamp && i < ms) {
+              muteMult = Math.min(muteMult, (ms - i) / duckRamp);
+            } else if (i >= me && i < me + duckRamp) {
+              muteMult = Math.min(muteMult, (i - me) / duckRamp);
+            }
+          }
+          if (muteMult <= 0) continue;
+
+          let effectiveBase = baseVol;
+          if (boostSolo && soloVol > baseVol) {
+            const tSec = i / sampleRate;
+            let soloFactor = 0;
+            if (introSec > 0.05 && tSec < introSec) {
+              const holdEnd = introSec - rampInSec;
+              soloFactor = tSec <= holdEnd ? 1 : Math.max(0, (introSec - tSec) / Math.max(0.01, rampInSec));
+            } else if (outroSec > 0.05 && tSec >= talkEndOut) {
+              const rampEnd = talkEndOut + rampOutSec;
+              soloFactor = tSec >= rampEnd ? 1 : Math.max(0, (tSec - talkEndOut) / Math.max(0.01, rampOutSec));
+            }
+            effectiveBase = baseVol + (soloVol - baseVol) * soloFactor;
+          }
+
+          const rel = i - startIdx;
+          let gain = effectiveBase * muteMult;
+          if (fadeInSamples > 0 && rel < fadeInSamples) {
+            gain *= rel / fadeInSamples;
+          }
+          const rem = endIdx - 1 - i;
+          if (fadeOutSamples > 0 && rem < fadeOutSamples) {
+            gain *= rem / fadeOutSamples;
+          }
+
+          const bIdx = rel % bgmLen;
+          outL[i] += bgmData.left[bIdx] * gain;
+          outR[i] += bgmData.right[bIdx] * gain;
+        }
+      }
+      bgmData = null;
+    }
+  }
+
+  // 3. SE合成（insert区間およびoverlay位置）
+  if (se && (insertSeEvents.length || overlaySeEvents.length)) {
+    editProgress(35, "効果音（SE）を配置中…");
+    let seData = await decodeFileToStereo(se, sampleRate);
+
+    for (const seg of timeline) {
+      if (seg.kind !== "insert") continue;
+      const dstStart = Math.max(0, Math.floor(seg.outStart * sampleRate));
+      const maxSamples = Math.floor(Math.max(0.05, seg.outEnd - seg.outStart) * sampleRate);
+      const copyLen = Math.min(seData.left.length, maxSamples, totalSamples - dstStart);
+      const vol = seg.seEvent.volume;
+      for (let j = 0; j < copyLen; j++) {
+        outL[dstStart + j] += seData.left[j] * vol;
+        outR[dstStart + j] += seData.right[j] * vol;
+      }
+    }
+
+    for (const ev of overlaySeEvents) {
+      const outputStart = mapOriginalToOutput(ev.time, timeline, talkEndOut);
+      const dstStart = Math.max(0, Math.floor(outputStart * sampleRate));
+      const copyLen = Math.min(seData.left.length, totalSamples - dstStart);
+      const vol = ev.volume;
+      for (let j = 0; j < copyLen; j++) {
+        outL[dstStart + j] += seData.left[j] * vol;
+        outR[dstStart + j] += seData.right[j] * vol;
+      }
+    }
+    seData = null;
+  }
+
+  // 4. 全体フェード処理
+  if (fades.length) {
+    editProgress(40, "フェードを適用中…");
+    for (const o of fades) {
+      const d = Math.max(0.01, o.end - o.start);
+      const st = o.effect === "out"
+        ? Math.max(0, totalOutDuration - d)
+        : (o.start <= 0.05 ? 0 : mapOriginalToOutput(o.start, timeline, talkEndOut));
+      const fStart = Math.max(0, Math.floor(st * sampleRate));
+      const fEnd = Math.min(totalSamples, Math.floor((st + d) * sampleRate));
+      const fLen = Math.max(1, fEnd - fStart);
+      for (let i = fStart; i < fEnd; i++) {
+        const t = (i - fStart) / fLen;
+        const g = o.effect === "out" ? (1 - t) : t;
+        outL[i] *= g;
+        outR[i] *= g;
+      }
+    }
+  }
+
+  return { outL, outR };
+}
+
+async function cleanupFiles(f, names) {
+  for (const name of names) {
+    try {
+      await f.deleteFile(name);
+    } catch {
+      // Ignore cleanup failure
+    }
+  }
+}
+
 async function render() {
   if (!source) throw Error("元音源ファイルが選択されていません。");
   const obj = validated || parseInstructions();
   const duration = sourceDuration || (await getDuration(source));
   const ops = obj.operations.filter((o) => o.type !== "marker");
+  const format = $("format").value;
 
   for (const o of obj.operations) {
     const end = o.type === "marker" || o.type === "se" ? o.time : o.end;
@@ -856,7 +1789,7 @@ async function render() {
   if (!keep.length) throw Error("音声全体がカットされています。");
 
   const bgmOps = ops.filter((o) => o.type === "bgm");
-  if (bgmOps.length && !bgm) {
+  if (bgmOps.length && !bgmTracks.length) {
     throw Error("BGM指示がありますが、BGMファイルが選択されていません。");
   }
 
@@ -865,207 +1798,226 @@ async function render() {
     throw Error("SE指示がありますが、場面切り替えSEファイルが選択されていません。");
   }
 
+  const useTelop = format === "mp4" && Boolean($("enableTelop")?.checked);
+  const rawTelopSegs = useTelop ? getActiveTelopSegments() : [];
+  if (useTelop && !rawTelopSegs.length) {
+    throw Error("テロップが有効ですが、字幕データがありません。STEP 01で文字起こしを実行するか、STEP 04で字幕ファイルを読み込んでください。");
+  }
+
+  resetWorker();
+
+  const profile = getDeviceProfile();
+  const sampleRate = format === "wav" ? 44100 : profile.sampleRate;
+  const introSec = Math.max(0, Math.min(30, Number($("introBgmSec")?.value) || 0));
+  const outroSec = Math.max(0, Math.min(30, Number($("outroBgmSec")?.value) || 0));
+  const boostSolo = $("boostBgmOnSolo")?.checked !== false;
+
   const insertSeEvents = se ? allSeEvents.filter((ev) => ev.mode === "insert") : [];
   const overlaySeEvents = se ? allSeEvents.filter((ev) => ev.mode !== "insert") : [];
-  const { timeline, totalOutDuration } = buildTimelineSegments(keep, insertSeEvents);
+  const fades = ops.filter((o) => o.type === "fade");
+  const { timeline, totalOutDuration, talkEndOut } = buildTimelineSegments(keep, insertSeEvents, introSec, outroSec);
 
+  // STEP 1: ブラウザ標準の高速メモリ処理で全音声を合成
+  const { outL, outR } = await mixAudioInMemory({
+    duration,
+    timeline,
+    totalOutDuration,
+    talkEndOut,
+    introSec,
+    outroSec,
+    boostSolo,
+    allSeEvents,
+    bgmOps,
+    insertSeEvents,
+    overlaySeEvents,
+    fades,
+    sampleRate
+  });
+
+  editProgress(44, "完成音声データを生成中…");
+  let wavBytes = encodeStereoWav(outL, outR, sampleRate);
+
+  if (format === "wav") {
+    const blob = new Blob([wavBytes], { type: "audio/wav" });
+    wavBytes = null;
+    return blob;
+  }
+
+  // STEP 2: MP3 / MP4 のみ完成済みWAV（＋軽量JPEG）をFFmpegで単発エンコード
   const f = await loadFF();
-  const { fetchFile } = await import("https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/dist/esm/index.js");
-  const ext = (source.name.split(".").pop() || "wav").toLowerCase().replace(/[^a-z0-9]/g, "") || "wav";
-  const srcName = `source.${ext}`;
-  const format = $("format").value;
-  const outName = `final.${format}`;
-  const tempFiles = [srcName, outName];
+  const tempFiles = ["mix.wav"];
 
   try {
-    editProgress(40, "素材データを編集エンジンへ読み込み中…");
-    await f.writeFile(srcName, await fetchFile(source));
+    editProgress(62, "音声データを変換エンジンへ転送中…");
+    await f.writeFile("mix.wav", wavBytes);
+    wavBytes = null;
 
-    const filters = [];
-    const labels = [];
-    timeline.forEach((seg, i) => {
-      if (seg.kind === "source") {
-        filters.push(
-          `[0:a]atrim=start=${seg.origStart}:end=${seg.origEnd},asetpts=PTS-STARTPTS,aformat=sample_rates=44100:channel_layouts=stereo[a${i}]`
-        );
-      } else {
-        const dur = Math.max(0.05, seg.outEnd - seg.outStart);
-        filters.push(
-          `anullsrc=r=44100:cl=stereo,atrim=start=0:end=${dur},asetpts=PTS-STARTPTS[a${i}]`
-        );
-      }
-      labels.push(`[a${i}]`);
-    });
-    filters.push(`${labels.join("")}concat=n=${labels.length}:v=0:a=1[voice]`);
-
-    const args = ["-i", srcName];
-    let nextInputIdx = 1;
-    const mixInputs = [];
-
-    // BGM（カットを跨いでも途切れず連続再生し、SE挿入区間のみ必要に応じてミュート）
-    if (bgmOps.length) {
-      const bext = (bgm.name.split(".").pop() || "mp3").toLowerCase().replace(/[^a-z0-9]/g, "") || "mp3";
-      const bedName = `bed.${bext}`;
-      tempFiles.push(bedName);
-      await f.writeFile(bedName, await fetchFile(bgm));
-      const bgmInputIdx = nextInputIdx++;
-      args.push("-stream_loop", "-1", "-i", bedName);
-
-      const muteOnInsert = $("muteBgmOnInsert")?.checked !== false;
-      const insertSegs = muteOnInsert ? timeline.filter((seg) => seg.kind === "insert") : [];
-
-      let n = 0;
-      for (const op of bgmOps) {
-        const outBgmStart = mapOriginalToOutput(op.start, timeline, totalOutDuration);
-        const outBgmEnd = op.end >= duration - 0.05
-          ? totalOutDuration
-          : mapOriginalToOutput(op.end, timeline, totalOutDuration);
-        const bgmOutDuration = outBgmEnd - outBgmStart;
-        if (bgmOutDuration <= 0.05) continue;
-
-        const delay = Math.max(0, Math.round(outBgmStart * 1000));
-        const label = `bed${n++}`;
-        const fadeIn = Math.min(Number(op.fade_in || 0), bgmOutDuration);
-        const fadeOut = Math.min(Number(op.fade_out || 0), bgmOutDuration);
-
-        let chain = `[${bgmInputIdx}:a]aformat=sample_rates=44100:channel_layouts=stereo,atrim=start=0:duration=${bgmOutDuration.toFixed(4)},asetpts=PTS-STARTPTS,volume=${op.volume}`;
-        if (fadeIn > 0) {
-          chain += `,afade=t=in:st=0:d=${fadeIn}`;
-        }
-        if (fadeOut > 0) {
-          chain += `,afade=t=out:st=${Math.max(0, bgmOutDuration - fadeOut).toFixed(4)}:d=${fadeOut}`;
-        }
-
-        // SE挿入（場面切り替え）区間中だけ連続BGMを一時ミュートする（ローカル時間基準）
-        const localMuteExprs = [];
-        for (const seg of insertSegs) {
-          const mStart = Math.max(0, seg.outStart - outBgmStart);
-          const mEnd = Math.min(bgmOutDuration, seg.outEnd - outBgmStart);
-          if (mEnd > mStart + 0.01) {
-            localMuteExprs.push(`between(t,${mStart.toFixed(3)},${mEnd.toFixed(3)})`);
-          }
-        }
-        if (localMuteExprs.length) {
-          chain += `,volume=0:enable='${localMuteExprs.join("+")}'`;
-        }
-
-        if (delay > 0) {
-          chain += `,adelay=${delay}|${delay}`;
-        }
-        filters.push(`${chain}[${label}]`);
-        mixInputs.push(`[${label}]`);
-      }
+    if (format === "mp3") {
+      tempFiles.push("final.mp3");
+      ffProgressRange = { start: 65, span: 28, label: "MP3形式で書き出し中…" };
+      editProgress(65, "MP3形式で書き出し中…");
+      await execFF(f, ["-y", "-i", "mix.wav", "-c:a", "libmp3lame", "-b:a", "192k", "final.mp3"]);
+      await cleanupFiles(f, ["mix.wav"]);
+      editProgress(95, "出力ファイルを生成中…");
+      const data = await f.readFile("final.mp3");
+      return new Blob([data.buffer], { type: "audio/mpeg" });
     }
 
-    // SE（insert区間およびoverlay位置の双方を出力タイムラインへ配置）
-    if (se && (insertSeEvents.length || overlaySeEvents.length)) {
-      const sext = (se.name.split(".").pop() || "mp3").toLowerCase().replace(/[^a-z0-9]/g, "") || "mp3";
-      const seName = `se.${sext}`;
-      tempFiles.push(seName);
-      await f.writeFile(seName, await fetchFile(se));
-      const seInputIdx = nextInputIdx++;
-      args.push("-i", seName);
+    // MP4出力
+    const w = profile.videoWidth;
+    const h = profile.videoHeight;
+    const blackSegs = timeline.filter((seg) => seg.kind === "insert" && seg.seEvent?.visual === "black");
+    const mappedCues = useTelop ? mapSubtitleCuesToOutput(rawTelopSegs, timeline) : [];
 
-      let sfxIdx = 0;
-      for (const seg of timeline) {
-        if (seg.kind !== "insert") continue;
-        const delay = Math.max(0, Math.round(seg.outStart * 1000));
-        const dur = Math.max(0.05, seg.outEnd - seg.outStart);
-        const label = `sfx${sfxIdx++}`;
-        filters.push(
-          `[${seInputIdx}:a]aformat=sample_rates=44100:channel_layouts=stereo,atrim=start=0:end=${dur},asetpts=PTS-STARTPTS,volume=${seg.seEvent.volume},adelay=${delay}|${delay}[${label}]`
-        );
-        mixInputs.push(`[${label}]`);
-      }
+    // テロップも暗転も無い場合は1枚のJPEGループで超高速出力
+    if (!mappedCues.length && !blackSegs.length) {
+      editProgress(63, "サムネイル画像を最適化中…", `${w}×${h}`);
+      const baseCanvas = await createBaseCanvas(thumbnail, w, h);
+      let jpegBytes = await canvasToJpegBytes(baseCanvas, 0.85);
+      baseCanvas.width = 0;
+      baseCanvas.height = 0;
 
-      for (const ev of overlaySeEvents) {
-        const outputStart = mapOriginalToOutput(ev.time, timeline, totalOutDuration);
-        const delay = Math.max(0, Math.round(outputStart * 1000));
-        const label = `sfx${sfxIdx++}`;
-        filters.push(
-          `[${seInputIdx}:a]aformat=sample_rates=44100:channel_layouts=stereo,asetpts=PTS-STARTPTS,volume=${ev.volume},adelay=${delay}|${delay}[${label}]`
-        );
-        mixInputs.push(`[${label}]`);
-      }
-    }
+      tempFiles.push("thumb.jpg", "final.mp4");
+      await f.writeFile("thumb.jpg", jpegBytes);
+      jpegBytes = null;
 
-    let map = "[voice]";
-    if (mixInputs.length) {
-      filters.push(`[voice]${mixInputs.join("")}amix=inputs=${mixInputs.length + 1}:duration=first:dropout_transition=0:normalize=0[mixed]`);
-      map = "[mixed]";
-    }
-
-    // フェード処理（最初と最後）
-    const fades = ops.filter((o) => o.type === "fade");
-    fades.forEach((o, i) => {
-      const d = Math.max(0.01, o.end - o.start);
-      const st = o.effect === "out"
-        ? Math.max(0, totalOutDuration - d)
-        : mapOriginalToOutput(o.start, timeline, totalOutDuration);
-      const next = `fade${i}`;
-      filters.push(`${map}afade=t=${o.effect}:st=${st}:d=${d}[${next}]`);
-      map = `[${next}]`;
-    });
-
-    let thumbInputIdx = null;
-    if (format === "mp4") {
-      thumbInputIdx = nextInputIdx++;
-      if (thumbnail) {
-        const text = (thumbnail.name.split(".").pop() || "png").toLowerCase().replace(/[^a-z0-9]/g, "") || "png";
-        const thumbName = `thumb.${text}`;
-        tempFiles.push(thumbName);
-        await f.writeFile(thumbName, await fetchFile(thumbnail));
-        args.push("-loop", "1", "-framerate", "1", "-i", thumbName);
-      } else {
-        args.push("-f", "lavfi", "-i", "color=c=0x0b1120:s=1280x720:r=1");
-      }
-    }
-
-    args.push("-filter_complex", filters.join(";"));
-
-    if (format === "mp4") {
-      const blackWindows = timeline
-        .filter((seg) => seg.kind === "insert" && seg.seEvent?.visual === "black")
-        .map((seg) => `between(t,${seg.outStart.toFixed(3)},${seg.outEnd.toFixed(3)})`);
-      let vf = "scale='min(1920,iw)':'min(1920,ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p";
-      if (blackWindows.length) {
-        vf += `,drawbox=c=black:t=fill:enable='${blackWindows.join("+")}'`;
-      }
-      args.push(
-        "-map", `${thumbInputIdx}:v`,
-        "-map", map,
+      ffProgressRange = { start: 66, span: 28, label: "MP4動画をエンコード中…" };
+      editProgress(66, "MP4動画をエンコード中…");
+      await execFF(f, [
+        "-y",
+        "-loop", "1",
+        "-framerate", "1",
+        "-t", Math.max(0.1, totalOutDuration).toFixed(3),
+        "-i", "thumb.jpg",
+        "-i", "mix.wav",
+        "-map", "0:v:0",
+        "-map", "1:a:0",
         "-c:v", "libx264",
         "-tune", "stillimage",
         "-preset", "ultrafast",
-        "-crf", "23",
-        "-vf", vf,
+        "-rc-lookahead", "0",
+        "-refs", "1",
+        "-bf", "0",
+        "-crf", profile.crf,
+        "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", "192k",
         "-shortest",
-        "-movflags", "+faststart",
-        outName
-      );
-    } else if (format === "mp3") {
-      args.push("-map", map, "-c:a", "libmp3lame", "-b:a", "192k", outName);
-    } else {
-      args.push("-map", map, "-c:a", "pcm_s16le", outName);
+        "final.mp4"
+      ]);
+      await cleanupFiles(f, ["thumb.jpg", "mix.wav"]);
+      editProgress(95, "出力ファイルを生成中…");
+      const data = await f.readFile("final.mp4");
+      return new Blob([data.buffer], { type: "video/mp4" });
     }
 
-    editProgress(45, format === "mp4" ? "MP4動画をエンコード中…" : "音声をレンダリング中…");
-    await f.exec(args);
-    editProgress(94, "出力ファイルを生成中…");
-    const data = await f.readFile(outName);
-    const mime = format === "mp4" ? "video/mp4" : format === "mp3" ? "audio/mpeg" : "audio/wav";
-    return new Blob([data.buffer], { type: mime });
+    // テロップまたはSE暗転がある場合はCanvas合成済み軽量JPEG＋concatデマルチプレクサで処理
+    editProgress(63, "テロップ・画面フレームを生成中…", `${w}×${h}`);
+    const baseCanvas = await createBaseCanvas(thumbnail, w, h);
+    const workCanvas = document.createElement("canvas");
+    workCanvas.width = w;
+    workCanvas.height = h;
+    const workCtx = workCanvas.getContext("2d");
+
+    tempFiles.push("f_base.jpg", "frames.txt", "final.mp4");
+    await f.writeFile("f_base.jpg", await canvasToJpegBytes(baseCanvas, 0.84));
+
+    if (blackSegs.length) {
+      workCtx.fillStyle = "#000000";
+      workCtx.fillRect(0, 0, w, h);
+      tempFiles.push("f_black.jpg");
+      await f.writeFile("f_black.jpg", await canvasToJpegBytes(workCanvas, 0.80));
+    }
+
+    const sizeKey = $("telopSize")?.value || "medium";
+    const styleKey = $("telopStyle")?.value || "band";
+    const posKey = $("telopPosition")?.value || "bottom";
+
+    const cueFiles = [];
+    for (let i = 0; i < mappedCues.length; i++) {
+      workCtx.clearRect(0, 0, w, h);
+      workCtx.drawImage(baseCanvas, 0, 0);
+      drawTelopOnCanvas(workCtx, w, h, mappedCues[i].text, { sizeKey, styleKey, posKey });
+      const fname = `f_c${i}.jpg`;
+      tempFiles.push(fname);
+      await f.writeFile(fname, await canvasToJpegBytes(workCanvas, 0.84));
+      cueFiles.push({ fname, outStart: mappedCues[i].outStart, outEnd: mappedCues[i].outEnd });
+    }
+
+    baseCanvas.width = 0;
+    baseCanvas.height = 0;
+    workCanvas.width = 0;
+    workCanvas.height = 0;
+
+    // タイムライン上の切替点を収集して視覚区間リストを構築
+    const points = new Set([0, totalOutDuration]);
+    for (const b of blackSegs) {
+      if (b.outStart > 0 && b.outStart < totalOutDuration) points.add(b.outStart);
+      if (b.outEnd > 0 && b.outEnd < totalOutDuration) points.add(b.outEnd);
+    }
+    for (const c of cueFiles) {
+      if (c.outStart > 0 && c.outStart < totalOutDuration) points.add(c.outStart);
+      if (c.outEnd > 0 && c.outEnd < totalOutDuration) points.add(c.outEnd);
+    }
+    const sortedPts = Array.from(points).sort((a, b) => a - b);
+    const concatLines = [];
+    let lastFile = "f_base.jpg";
+
+    for (let i = 0; i < sortedPts.length - 1; i++) {
+      const s = sortedPts[i];
+      const e = sortedPts[i + 1];
+      const dur = e - s;
+      if (dur <= 0.005) continue;
+      const mid = (s + e) * 0.5;
+
+      let chosen = "f_base.jpg";
+      if (blackSegs.some((b) => mid >= b.outStart && mid < b.outEnd)) {
+        chosen = "f_black.jpg";
+      } else {
+        const cue = cueFiles.find((c) => mid >= c.outStart && mid < c.outEnd);
+        if (cue) chosen = cue.fname;
+      }
+      lastFile = chosen;
+      concatLines.push(`file '${chosen}'`);
+      concatLines.push(`duration ${dur.toFixed(4)}`);
+    }
+    concatLines.push(`file '${lastFile}'`);
+
+    await f.writeFile("frames.txt", concatLines.join("\n"));
+
+    ffProgressRange = { start: 67, span: 27, label: "MP4動画をエンコード中…" };
+    editProgress(67, "MP4動画をエンコード中…");
+    await execFF(f, [
+      "-y",
+      "-f", "concat",
+      "-safe", "0",
+      "-i", "frames.txt",
+      "-i", "mix.wav",
+      "-map", "0:v:0",
+      "-map", "1:a:0",
+      "-vf", "fps=2,format=yuv420p",
+      "-c:v", "libx264",
+      "-tune", "stillimage",
+      "-preset", "ultrafast",
+      "-rc-lookahead", "0",
+      "-refs", "1",
+      "-bf", "0",
+      "-crf", profile.crf,
+      "-c:a", "aac",
+      "-b:a", "192k",
+      "-shortest",
+      "final.mp4"
+    ]);
+
+    editProgress(95, "出力ファイルを生成中…");
+    const data = await f.readFile("final.mp4");
+    return new Blob([data.buffer], { type: "video/mp4" });
   } catch (err) {
+    resetFF();
     throw new Error(formatError(err));
   } finally {
-    for (const fileName of tempFiles) {
-      try {
-        await f.deleteFile(fileName);
-      } catch {
-        // Ignore cleanup failure
-      }
+    if (ff && ff.loaded) {
+      await cleanupFiles(f, tempFiles);
     }
   }
 }
@@ -1074,7 +2026,7 @@ $("execute").onclick = async () => {
   if (!validated && !validate()) return;
   $("execute").disabled = true;
   try {
-    editProgress(2, "編集エンジンを準備中…");
+    editProgress(2, "編集処理を準備中…");
     const format = $("format").value;
     const blob = await render();
     if (outputUrl) URL.revokeObjectURL(outputUrl);
@@ -1106,8 +2058,9 @@ $("execute").onclick = async () => {
     editProgress(0, "エラー", msg);
     alert("編集できませんでした: " + msg);
   } finally {
-    $("execute").disabled = false;
+    updateExecuteButtonState();
   }
 };
 
+updateTelopStatus();
 updateSkipTranscribeState();

@@ -6,7 +6,6 @@ const MODEL_IDS = {
   small: "onnx-community/whisper-small"
 };
 
-// 20秒分の音声ブロックを処理する初期推定時間（ミリ秒）
 const INITIAL_CHUNK_MS = {
   tiny: 3500,
   base: 6000,
@@ -131,7 +130,6 @@ async function getASR(modelKey) {
           const ratio = totalBytes > 0
             ? loadedBytes / totalBytes
             : (count > 0 ? pctSum / (count * 100) : (p.progress || 0) / 100);
-          // ダウンロード区間は 6% 〜 20% に割り当て
           const percent = Math.min(20, 6 + ratio * 14);
           const sizeInfo = total > 0 ? ` (${formatMB(loaded)} / ${formatMB(total)})` : "";
 
@@ -159,7 +157,6 @@ async function getASR(modelKey) {
               text: "推論エンジン（WASM）を初期化中…",
               detail: "初回のみ数秒〜数十秒かかります"
             });
-            // コンパイル中も 20.5% 〜 24.8% の範囲で滑らかに進める
             compileTimer = setInterval(() => {
               const sec = (Date.now() - compileStart) / 1000;
               const pct = Math.min(24.8, 20.5 + 4.3 * (1 - Math.exp(-sec / 12)));
@@ -234,7 +231,6 @@ self.onmessage = async (event) => {
     const effectiveStepS = chunkLengthS - strideLengthS * 2;
     const estimatedChunks = Math.max(1, Math.ceil(durationSeconds / effectiveStepS));
 
-    // メモリ上にモデルロード済みなら 8%〜96%、初回ロード後なら 25%〜96% を推論に割り当て
     const inferStartPct = wasCachedInMemory ? 8 : 25;
     const inferEndPct = 96;
     const inferSpanPct = inferEndPct - inferStartPct;
@@ -248,7 +244,6 @@ self.onmessage = async (event) => {
     const emitInferProgress = () => {
       const now = Date.now();
       const sinceLastMs = Math.max(0, now - lastChunkAt);
-      // 現在のブロック内の進捗を漸近曲線で滑らかに補間（0〜0.92）
       const intraFraction = processedChunks >= estimatedChunks
         ? 0.95
         : 0.92 * (1 - Math.exp(-2.2 * (sinceLastMs / Math.max(800, avgChunkMs))));
@@ -288,7 +283,6 @@ self.onmessage = async (event) => {
         const now = Date.now();
         processedChunks += 1;
         lastChunkAt = now;
-        // 実測された1ブロックあたりの平均処理時間で残り時間予測を自動補正
         const measuredAvg = (now - inferStartedAt) / processedChunks;
         avgChunkMs = measuredAvg * 0.8 + avgChunkMs * 0.2;
         emitInferProgress();
