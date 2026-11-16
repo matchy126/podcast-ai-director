@@ -278,7 +278,7 @@ main {
 }
 
 .controls > label {
-  flex: 1 1 200px;
+  flex: 1 1 240px;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -288,8 +288,7 @@ main {
 }
 
 .controls select,
-.controls input[type="file"],
-.controls input[type="number"] {
+.controls input[type="file"] {
   width: 100%;
   padding: 10px 12px;
   border-radius: 10px;
@@ -489,7 +488,6 @@ textarea {
 
 textarea:focus,
 select:focus,
-input[type="number"]:focus,
 button:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
@@ -635,183 +633,6 @@ button:focus-visible {
   font-variant-numeric: tabular-nums;
 }
 
-/* Subpanels for BGM Playlist & Telop settings */
-.subpanel {
-  background: rgba(9, 15, 29, 0.68);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 14px 16px;
-  margin-bottom: 16px;
-}
-
-.subpanel-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-bottom: 12px;
-}
-
-.subpanel-head > b {
-  font-size: 14px;
-  color: var(--text);
-}
-
-.subpanel-head > small {
-  font-size: 12px;
-  color: var(--muted);
-}
-
-.subpanel .row:last-child {
-  margin-bottom: 0;
-}
-
-.inline-btn-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-}
-
-.split-inputs {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(110px, 1fr));
-  gap: 10px;
-}
-
-.mini-field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--muted);
-}
-
-.mini-field input[type="number"] {
-  padding: 8px 10px;
-  border-radius: 8px;
-  border: 1px solid var(--border-strong);
-  background: var(--surface-2);
-  color: var(--text);
-  font-size: 13px;
-}
-
-.playlist-box {
-  margin-top: 6px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--surface);
-  padding: 6px;
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-}
-
-.playlist-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 6px 8px;
-  border-radius: 8px;
-  background: var(--surface-2);
-  font-size: 12px;
-}
-
-.playlist-item-info {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  flex: 1;
-}
-
-.playlist-badge {
-  display: inline-grid;
-  place-items: center;
-  width: 20px;
-  height: 20px;
-  border-radius: 6px;
-  background: var(--accent-soft);
-  color: var(--accent);
-  font-weight: 700;
-  font-size: 11px;
-  flex-shrink: 0;
-}
-
-.playlist-title {
-  color: var(--text);
-  font-weight: 600;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.playlist-dur {
-  color: var(--muted);
-  font-variant-numeric: tabular-nums;
-  flex-shrink: 0;
-}
-
-.playlist-actions {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  flex-shrink: 0;
-}
-
-.icon-btn {
-  padding: 3px 7px;
-  border-radius: 6px;
-  font-size: 11px;
-  font-weight: 700;
-  background: var(--surface);
-  color: var(--muted);
-  border: 1px solid var(--border-strong);
-}
-
-.icon-btn:hover:not(:disabled) {
-  color: var(--text);
-  border-color: var(--accent);
-}
-
-.playlist-note {
-  padding: 4px 8px 2px;
-  font-size: 11px;
-  color: var(--accent);
-}
-
-.telop-toggle {
-  margin-top: 0 !important;
-  font-size: 14px !important;
-  font-weight: 700 !important;
-  color: var(--text) !important;
-}
-
-.telop-status-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 8px;
-  padding: 8px 10px;
-  border-radius: 8px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-}
-
-.telop-status-row small {
-  font-size: 12px;
-  color: var(--muted);
-}
-
-.telop-status-row small.ok {
-  color: var(--ok);
-  font-weight: 600;
-}
-
 #output {
   margin-top: 14px;
 }
@@ -850,6 +671,65 @@ footer {
   color: var(--muted);
 }
 
+.transcript-container {
+  max-height: 400px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px;
+  margin: 8px 0;
+  background: #090f1d;
+}
+
+.seg {
+  display: flex;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  align-items: flex-start;
+}
+
+.seg:last-child {
+  border-bottom: none;
+}
+
+.seg-time {
+  color: var(--accent);
+  font-size: 12px;
+  min-width: 110px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.seg-time:hover {
+  text-decoration: underline;
+}
+
+.seg-speaker {
+  min-width: 60px;
+}
+
+.seg-speaker select {
+  font-size: 12px;
+  padding: 2px 4px;
+  border-radius: 4px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.seg-text {
+  flex: 1;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.speaker-A { background: rgba(56, 189, 248, 0.12); }
+.speaker-B { background: rgba(192, 132, 252, 0.12); }
+.speaker-C { background: rgba(52, 211, 153, 0.12); }
+.speaker-D { background: rgba(251, 191, 36, 0.12); }
+.speaker-unknown { background: transparent; }
+
 .small-btn {
   font-size: 12px;
   padding: 6px 12px;
@@ -874,6 +754,7 @@ footer {
     padding-left: 52px;
   }
 }
+
 
 .checkbox-inline {
   display: inline-flex;
