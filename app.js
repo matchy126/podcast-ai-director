@@ -524,7 +524,7 @@ async function decodeAudioTo16kMono(file) {
 
 function getWorker() {
   if (!activeWorker) {
-    activeWorker = new Worker("./transcribe-worker.js?v=0.7.2", { type: "module" });
+    activeWorker = new Worker("./transcribe-worker.js?v=0.7.3", { type: "module" });
   }
   return activeWorker;
 }
@@ -987,7 +987,11 @@ async function loadFF() {
     const instance = new FFmpeg();
     instance.on("progress", ({ progress: p }) => {
       const ratio = Number.isFinite(p) ? Math.min(1, Math.max(0, p)) : 0;
-      editProgress(48 + Math.round(ratio * 44), "メディアをレンダリング中…", `${Math.round(ratio * 100)}%`);
+      if (ratio >= 0.995) {
+        editProgress(93, "出力ファイルをファイナライズ中…", "100%");
+      } else {
+        editProgress(48 + Math.round(ratio * 44), "メディアをレンダリング中…", `${Math.round(ratio * 100)}%`);
+      }
     });
     const base = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm";
     const workerCode = 'import "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/worker.js";';
@@ -1225,39 +1229,113 @@ function scheduleBgmSegments({
 }
 
 /**
- * 冒頭・終了のBGMオンリー区間でBGM音量を上げ、トーク開始時に自然に下げる音量式を生成
+ * 冒頭・終了のBGMオンリー区間でBGM音量を上げ、トーク開始時に自然に下げるフィルタ群を生成（eval=frame不使用・高速版）
  */
-function buildBgmVolumeFilter({ baseVol, segStart, introSec, outroSec, talkEndOut, boostSolo }) {
-  if (!boostSolo || (introSec <= 0.05 && outroSec <= 0.05)) {
-    return `volume=${baseVol.toFixed(4)}`;
-  }
+function appendBgmGainFilters(filters, inPad, outPad, { baseVol, segStart, segDur, introSec, outroSec, talkEndOut, boostSolo }) {
   const soloVol = Math.min(0.45, Math.max(baseVol * 2.2, baseVol + 0.08));
-  const rampIn = introSec > 0.05 ? Math.min(1.2, introSec * 0.45) : 0;
-  const rampOut = outroSec > 0.05 ? Math.min(1.2, outroSec * 0.45) : 0;
-  const tg = `(t+${segStart.toFixed(3)})`;
-
-  let bodyExpr = baseVol.toFixed(4);
-  if (outroSec > 0.05) {
-    if (rampOut > 0.05) {
-      const diff = (soloVol - baseVol).toFixed(4);
-      bodyExpr = `if(lt(${tg},${talkEndOut.toFixed(3)}),${baseVol.toFixed(4)},if(lt(${tg},${(talkEndOut + rampOut).toFixed(3)}),${baseVol.toFixed(4)}+${diff}*(${tg}-${talkEndOut.toFixed(3)})/${rampOut.toFixed(3)},${soloVol.toFixed(4)}))`;
-    } else {
-      bodyExpr = `if(lt(${tg},${talkEndOut.toFixed(3)}),${baseVol.toFixed(4)},${soloVol.toFixed(4)})`;
-    }
+  const extraVol = soloVol - baseVol;
+  if (!boostSolo || extraVol <= 0.005 || (introSec <= 0.05 && outroSec <= 0.05)) {
+    filters.push(`${inPad}volume=${baseVol.toFixed(4)}${outPad}`);
+    return;
   }
 
-  let fullExpr = bodyExpr;
+  const segEnd = segStart + segDur;
+  const slices = [];
+
+  // 冒頭BGMオンリー区間のブースト成分
   if (introSec > 0.05) {
-    if (rampIn > 0.05) {
-      const holdEnd = Math.max(0, introSec - rampIn);
-      const diff = (soloVol - baseVol).toFixed(4);
-      fullExpr = `if(lt(${tg},${holdEnd.toFixed(3)}),${soloVol.toFixed(4)},if(lt(${tg},${introSec.toFixed(3)}),${soloVol.toFixed(4)}-${diff}*(${tg}-${holdEnd.toFixed(3)})/${rampIn.toFixed(3)},${bodyExpr}))`;
-    } else {
-      fullExpr = `if(lt(${tg},${introSec.toFixed(3)}),${soloVol.toFixed(4)},${bodyExpr})`;
+    const ovStart = Math.max(segStart, 0);
+    const ovEnd = Math.min(segEnd, introSec);
+    if (ovEnd > ovStart + 0.02) {
+      const rampIn = Math.min(1.2, introSec * 0.45);
+      const holdEndGlobal = Math.max(0, introSec - rampIn);
+      const locStart = ovStart - segStart;
+      const locEnd = ovEnd - segStart;
+      const sliceDur = locEnd - locStart;
+      const fadeStartGlobal = Math.max(ovStart, holdEndGlobal);
+      const fadeSt = Math.max(0, fadeStartGlobal - ovStart);
+      const fadeDur = Math.max(0.01, ovEnd - fadeStartGlobal);
+      slices.push({ locStart, locEnd, sliceDur, fadeType: "out", fadeSt, fadeDur });
     }
   }
 
-  return `volume='${fullExpr}':eval=frame`;
+  // 終了BGMオンリー区間のブースト成分
+  if (outroSec > 0.05) {
+    const outroGlobalStart = talkEndOut;
+    const outroGlobalEnd = talkEndOut + outroSec;
+    const ovStart = Math.max(segStart, outroGlobalStart);
+    const ovEnd = Math.min(segEnd, outroGlobalEnd);
+    if (ovEnd > ovStart + 0.02) {
+      const rampOut = Math.min(1.2, outroSec * 0.45);
+      const rampEndGlobal = Math.min(outroGlobalEnd, outroGlobalStart + rampOut);
+      const locStart = ovStart - segStart;
+      const locEnd = ovEnd - segStart;
+      const sliceDur = locEnd - locStart;
+      const fadeDur = ovStart < rampEndGlobal ? Math.max(0.01, rampEndGlobal - ovStart) : 0;
+      slices.push({ locStart, locEnd, sliceDur, fadeType: "in", fadeSt: 0, fadeDur });
+    }
+  }
+
+  if (!slices.length) {
+    filters.push(`${inPad}volume=${baseVol.toFixed(4)}${outPad}`);
+    return;
+  }
+
+  const tag = outPad.replace(/[^a-zA-Z0-9_]/g, "");
+  const splitPads = [`[${tag}_b0]`, ...slices.map((_, i) => `[${tag}_s${i}]`)];
+  filters.push(`${inPad}asplit=${splitPads.length}${splitPads.join("")}`);
+  filters.push(`[${tag}_b0]volume=${baseVol.toFixed(4)}[${tag}_base]`);
+
+  const mixPads = [`[${tag}_base]`];
+  slices.forEach((sl, i) => {
+    let sc = `[${tag}_s${i}]atrim=start=${sl.locStart.toFixed(4)}:end=${sl.locEnd.toFixed(4)},asetpts=PTS-STARTPTS,volume=${extraVol.toFixed(4)}`;
+    if (sl.fadeDur > 0.01) {
+      sc += `,afade=t=${sl.fadeType}:st=${sl.fadeSt.toFixed(4)}:d=${Math.min(sl.fadeDur, sl.sliceDur).toFixed(4)}`;
+    }
+    const dMs = Math.round(sl.locStart * 1000);
+    if (dMs > 0) {
+      sc += `,adelay=${dMs}|${dMs}`;
+    }
+    const donePad = `[${tag}_sd${i}]`;
+    filters.push(`${sc}${donePad}`);
+    mixPads.push(donePad);
+  });
+
+  filters.push(`${mixPads.join("")}amix=inputs=${mixPads.length}:duration=first:dropout_transition=0:normalize=0${outPad}`);
+}
+
+async function renderBaseFramePng(thumbnailFile) {
+  const width = 1280;
+  const height = 720;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#0b1120";
+  ctx.fillRect(0, 0, width, height);
+
+  if (thumbnailFile) {
+    const imgUrl = URL.createObjectURL(thumbnailFile);
+    try {
+      const img = await new Promise((resolve, reject) => {
+        const el = new Image();
+        el.onload = () => resolve(el);
+        el.onerror = () => reject(new Error("サムネイル画像のデコードに失敗しました。"));
+        el.src = imgUrl;
+      });
+      const scale = Math.min(width / img.naturalWidth, height / img.naturalHeight);
+      const drawW = Math.round(img.naturalWidth * scale);
+      const drawH = Math.round(img.naturalHeight * scale);
+      const drawX = Math.round((width - drawW) / 2);
+      const drawY = Math.round((height - drawH) / 2);
+      ctx.drawImage(img, drawX, drawY, drawW, drawH);
+    } finally {
+      URL.revokeObjectURL(imgUrl);
+    }
+  }
+
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+  return new Uint8Array(await blob.arrayBuffer());
 }
 
 /**
@@ -1544,16 +1622,22 @@ async function render() {
           const inputIdx = trackInputIndices[seg.trackIndex];
           const delay = Math.max(0, Math.round(seg.outStart * 1000));
           const label = `bed${n++}`;
-          const volFilter = buildBgmVolumeFilter({
+          const rawPad = `[${label}_raw]`;
+          const volPad = `[${label}_vol]`;
+          filters.push(
+            `[${inputIdx}:a]aformat=sample_rates=44100:channel_layouts=stereo,atrim=start=0:duration=${segDur.toFixed(4)},asetpts=PTS-STARTPTS${rawPad}`
+          );
+          appendBgmGainFilters(filters, rawPad, volPad, {
             baseVol: seg.baseVolume,
             segStart: seg.outStart,
+            segDur,
             introSec,
             outroSec,
             talkEndOut,
             boostSolo
           });
 
-          let chain = `[${inputIdx}:a]aformat=sample_rates=44100:channel_layouts=stereo,atrim=start=0:duration=${segDur.toFixed(4)},asetpts=PTS-STARTPTS,${volFilter}`;
+          let chain = volPad;
           if (seg.fadeIn > 0.01) {
             chain += `,afade=t=in:st=0:d=${Math.min(seg.fadeIn, segDur).toFixed(4)}`;
           }
@@ -1635,19 +1719,17 @@ async function render() {
 
     let thumbInputIdx = null;
     const telopOverlays = [];
+    const videoTargetDur = Math.max(0.1, totalOutDuration).toFixed(3);
 
     if (format === "mp4") {
       const fps = useTelop ? "4" : "1";
       thumbInputIdx = nextInputIdx++;
-      if (thumbnail) {
-        const text = (thumbnail.name.split(".").pop() || "png").toLowerCase().replace(/[^a-z0-9]/g, "") || "png";
-        const thumbName = `thumb.${text}`;
-        tempFiles.push(thumbName);
-        await f.writeFile(thumbName, await fetchFile(thumbnail));
-        args.push("-loop", "1", "-framerate", fps, "-i", thumbName);
-      } else {
-        args.push("-f", "lavfi", "-i", `color=c=0x0b1120:s=1280x720:r=${fps}`);
-      }
+      // 1280x720のベースPNGをブラウザ内で生成し、-t で有限長を指定して無限ループ待機を防ぐ
+      const basePngBytes = await renderBaseFramePng(thumbnail);
+      const thumbName = "base_frame.png";
+      tempFiles.push(thumbName);
+      await f.writeFile(thumbName, basePngBytes);
+      args.push("-loop", "1", "-framerate", fps, "-t", videoTargetDur, "-i", thumbName);
 
       if (useTelop) {
         editProgress(43, "テロップ（字幕）画像を生成中…");
@@ -1675,10 +1757,7 @@ async function render() {
 
     let videoMap = null;
     if (format === "mp4") {
-      // ベース映像を 1280x720 に統一してテロップ座標と完全に一致させる
-      filters.push(
-        `[${thumbInputIdx}:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=0x0b1120,format=yuv420p[vbase]`
-      );
+      filters.push(`[${thumbInputIdx}:v]format=yuv420p[vbase]`);
       let vCur = "[vbase]";
 
       if (telopOverlays.length) {
@@ -1714,10 +1793,10 @@ async function render() {
         "-tune", "stillimage",
         "-preset", "ultrafast",
         "-crf", "23",
+        "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", "192k",
         "-shortest",
-        "-movflags", "+faststart",
         outName
       );
     } else if (format === "mp3") {
