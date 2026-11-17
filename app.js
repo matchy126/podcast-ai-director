@@ -1,4 +1,4 @@
-// Podcast AI Director v0.8.4
+// Podcast AI Director v0.8.5
 // WebGPU + VAD Fast Transcription, Low-Memory WebAudio Mixing, Multi-BGM, Intro/Outro Solo Boost, MP4 Telop
 
 const $ = (id) => document.getElementById(id);
@@ -21,6 +21,7 @@ let sourceUrl = null;
 let activeWorker = null;
 let elapsedTimer = null;
 
+let ffProgressReporter = editProgress;
 let ffProgressRange = {
   start: 65,
   span: 30,
@@ -520,36 +521,143 @@ bindFileInput($("telopFile"), async (file) => {
   }
 });
 
-async function decodeAudioTo16kMono(file) {
-  const AudioCtx = window.AudioContext || window.webkitAudioContext;
-  if (!AudioCtx) {
-    throw new Error("このブラウザはAudioContextに対応していません。");
-  }
-  const arrayBuffer = await file.arrayBuffer();
-  const ctx = new AudioCtx();
-  let decoded;
+async function decodeAudioWithFFmpegFallback(file, channels, targetSampleRate, reporter = editProgress, basePct = 3, spanPct = 2) {
+  ffProgressReporter = reporter;
+  ffProgressRange = { start: basePct, span: spanPct, label: "変換エンジンで音声をデコード中…" };
+  const f = await loadFF(reporter);
+
+  const extMatch = (file.name || "").match(/\.([a-zA-Z0-9]{1,8})$/);
+  const ext = extMatch ? extMatch[1].toLowerCase() : "bin";
+  const uid = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const outName = `dec_${uid}.pcm`;
+  let inputPath = `in_${uid}.${ext}`;
+  let mountedDir = null;
+  let wroteTempInput = false;
+
   try {
-    decoded = await ctx.decodeAudioData(arrayBuffer);
+    try {
+      mountedDir = `/mnt_${uid}`;
+      await f.createDir(mountedDir);
+      await f.mount("WORKERFS", { files: [file] }, mountedDir);
+      inputPath = `${mountedDir}/${file.name}`;
+    } catch {
+      if (mountedDir) {
+        try { await f.unmount(mountedDir); } catch {}
+        try { await f.deleteDir(mountedDir); } catch {}
+        mountedDir = null;
+      }
+      const buf = new Uint8Array(await file.arrayBuffer());
+      await f.writeFile(inputPath, buf);
+      wroteTempInput = true;
+    }
+
+    reporter(basePct, "変換エンジンで音声をデコード中…", file.name || "");
+    await execFF(f, [
+      "-y",
+      "-i", inputPath,
+      "-vn",
+      "-sn",
+      "-dn",
+      "-ac", String(channels),
+      "-ar", String(targetSampleRate),
+      "-f", "s16le",
+      outName
+    ]);
+
+    const pcmBytes = await f.readFile(outName);
+    if (!pcmBytes || pcmBytes.byteLength < 2) {
+      throw new Error("音声トラックが空か、読み取れる音声データが含まれていません。");
+    }
+
+    const alignedBuf = pcmBytes.byteOffset % 2 === 0
+      ? pcmBytes.buffer
+      : pcmBytes.slice().buffer;
+    const byteOffset = pcmBytes.byteOffset % 2 === 0 ? pcmBytes.byteOffset : 0;
+    const sampleCount = Math.floor(pcmBytes.byteLength / 2);
+    const int16 = new Int16Array(alignedBuf, byteOffset, sampleCount);
+
+    if (channels === 1) {
+      const mono = new Float32Array(sampleCount);
+      for (let i = 0; i < sampleCount; i++) {
+        mono[i] = int16[i] / 32768;
+      }
+      return mono;
+    }
+
+    const frames = Math.floor(sampleCount / 2);
+    const left = new Float32Array(frames);
+    const right = new Float32Array(frames);
+    for (let i = 0; i < frames; i++) {
+      left[i] = int16[i * 2] / 32768;
+      right[i] = int16[i * 2 + 1] / 32768;
+    }
+    return {
+      left,
+      right,
+      duration: frames / targetSampleRate,
+      sampleRate: targetSampleRate
+    };
   } finally {
-    await ctx.close().catch(() => {});
+    await cleanupFiles(f, wroteTempInput ? [outName, inputPath] : [outName]);
+    if (mountedDir) {
+      try { await f.unmount(mountedDir); } catch {}
+      try { await f.deleteDir(mountedDir); } catch {}
+    }
+    ffProgressReporter = editProgress;
+  }
+}
+
+async function decodeAudioTo16kMono(file) {
+  if (!file || file.size === 0) {
+    throw new Error("選択されたファイルが空（0バイト）です。別の音声ファイルを選択してください。");
+  }
+  const targetRate = 16000;
+  let mono = null;
+  let browserDecodeErr = null;
+
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  if (AudioCtx) {
+    const ctx = new AudioCtx();
+    try {
+      let arrayBuffer = await file.arrayBuffer();
+      let decoded = await ctx.decodeAudioData(arrayBuffer);
+      arrayBuffer = null;
+
+      const targetLength = Math.max(1, Math.ceil(decoded.duration * targetRate));
+      const offline = new OfflineAudioContext(1, targetLength, targetRate);
+      const srcNode = offline.createBufferSource();
+      srcNode.buffer = decoded;
+      srcNode.connect(offline.destination);
+      srcNode.start(0);
+      const rendered = await offline.startRendering();
+      mono = new Float32Array(rendered.getChannelData(0));
+      decoded = null;
+    } catch (err) {
+      browserDecodeErr = err;
+    } finally {
+      await ctx.close().catch(() => {});
+    }
   }
 
-  if (!sourceDuration && Number.isFinite(decoded.duration)) {
-    sourceDuration = decoded.duration;
+  if (!mono) {
+    try {
+      progress(2.5, "ブラウザ非対応形式のため変換エンジンでデコード中…", file.name || "");
+      mono = await decodeAudioWithFFmpegFallback(file, 1, targetRate, progress, 3, 2);
+    } catch (ffErr) {
+      const reason = formatError(ffErr) || formatError(browserDecodeErr);
+      throw new Error(
+        `音声データをデコードできませんでした（${file.name}）。ファイルが破損しているか、DRM保護・非対応形式の可能性があります。MP3またはWAVに変換してお試しください。（詳細: ${reason}）`
+      );
+    }
+  }
+
+  const decodedDuration = mono.length / targetRate;
+  if (!sourceDuration && Number.isFinite(decodedDuration) && decodedDuration > 0) {
+    sourceDuration = decodedDuration;
     $("sourceDuration").textContent = `音源の長さ：${fmt(sourceDuration)}`;
     updateExecuteButtonState();
   }
 
-  const targetRate = 16000;
-  const targetLength = Math.max(1, Math.ceil(decoded.duration * targetRate));
-  const offline = new OfflineAudioContext(1, targetLength, targetRate);
-  const srcNode = offline.createBufferSource();
-  srcNode.buffer = decoded;
-  srcNode.connect(offline.destination);
-  srcNode.start(0);
-  const rendered = await offline.startRendering();
-  const mono = new Float32Array(rendered.getChannelData(0));
-  decoded = null;
   return mono;
 }
 
@@ -586,7 +694,7 @@ function formatEtaShort(sec) {
 
 function getWorker() {
   if (!activeWorker) {
-    activeWorker = new Worker("./transcribe-worker.js?v=0.8.4", { type: "module" });
+    activeWorker = new Worker("./transcribe-worker.js?v=0.8.5", { type: "module" });
   }
   return activeWorker;
 }
@@ -1239,12 +1347,19 @@ function resetFF() {
   ffLogs = [];
 }
 
-async function loadFF() {
+async function loadFF(reporter = editProgress) {
+  ffProgressReporter = reporter;
   if (ff && ff.loaded) return ff;
   if (ffLoadPromise) return ffLoadPromise;
 
+  const isStep1 = reporter === progress;
+  const pInit = isStep1 ? 3 : 46;
+  const pCore = isStep1 ? 3.5 : 50;
+  const pWasm = isStep1 ? 4 : 55;
+  const pReady = isStep1 ? 4.5 : 60;
+
   ffLoadPromise = (async () => {
-    editProgress(46, "変換エンジンを読み込み中…", "@ffmpeg/ffmpeg");
+    ffProgressReporter(pInit, "変換エンジンを読み込み中…", "@ffmpeg/ffmpeg");
     const [{ FFmpeg }, { toBlobURL }] = await Promise.all([
       import("https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/index.js"),
       import("https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/dist/esm/index.js")
@@ -1258,17 +1373,17 @@ async function loadFF() {
     });
     instance.on("progress", ({ progress: p }) => {
       const ratio = Number.isFinite(p) ? Math.min(1, Math.max(0, p)) : 0;
-      const pct = Math.min(95, Math.round(ffProgressRange.start + ratio * ffProgressRange.span));
-      editProgress(pct, ffProgressRange.label, `${Math.round(ratio * 100)}%`);
+      const pct = Math.min(95, ffProgressRange.start + ratio * ffProgressRange.span);
+      ffProgressReporter(pct, ffProgressRange.label, `${Math.round(ratio * 100)}%`);
     });
     const base = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm";
     const workerCode = 'import "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/worker.js";';
     const classWorkerURL = URL.createObjectURL(new Blob([workerCode], { type: "text/javascript" }));
-    editProgress(50, "FFmpegコアをダウンロード中…", "初回のみエンジンを取得します");
+    ffProgressReporter(pCore, "FFmpegコアをダウンロード中…", "初回のみエンジンを取得します");
     const coreURL = await toBlobURL(base + "/ffmpeg-core.js", "text/javascript");
-    editProgress(55, "FFmpeg WASMをダウンロード中…", "ffmpeg-core.wasm");
+    ffProgressReporter(pWasm, "FFmpeg WASMをダウンロード中…", "ffmpeg-core.wasm");
     const wasmURL = await toBlobURL(base + "/ffmpeg-core.wasm", "application/wasm");
-    editProgress(60, "FFmpegエンジンを初期化中…", "");
+    ffProgressReporter(pReady, "FFmpegエンジンを初期化中…", "");
     await instance.load({ classWorkerURL, coreURL, wasmURL });
     URL.revokeObjectURL(classWorkerURL);
     if (!instance.loaded) {
@@ -1509,41 +1624,52 @@ async function getDuration(file) {
 }
 
 async function decodeFileToStereo(file, targetSampleRate) {
+  if (!file || file.size === 0) {
+    throw new Error("音声ファイルが空（0バイト）です。");
+  }
   const AudioCtx = window.AudioContext || window.webkitAudioContext;
-  if (!AudioCtx) {
-    throw new Error("このブラウザはAudioContextに対応していません。");
+  if (AudioCtx) {
+    const ctx = new AudioCtx();
+    try {
+      let arrayBuffer = await file.arrayBuffer();
+      let decoded = await ctx.decodeAudioData(arrayBuffer);
+      arrayBuffer = null;
+
+      const duration = decoded.duration;
+      if (decoded.sampleRate === targetSampleRate) {
+        const left = new Float32Array(decoded.getChannelData(0));
+        const right = decoded.numberOfChannels > 1
+          ? new Float32Array(decoded.getChannelData(1))
+          : new Float32Array(left);
+        decoded = null;
+        return { left, right, duration, sampleRate: targetSampleRate };
+      }
+
+      const targetLength = Math.max(1, Math.ceil(duration * targetSampleRate));
+      const offline = new OfflineAudioContext(2, targetLength, targetSampleRate);
+      const srcNode = offline.createBufferSource();
+      srcNode.buffer = decoded;
+      srcNode.connect(offline.destination);
+      srcNode.start(0);
+      const rendered = await offline.startRendering();
+      const left = new Float32Array(rendered.getChannelData(0));
+      const right = new Float32Array(rendered.getChannelData(1));
+      decoded = null;
+      return { left, right, duration, sampleRate: targetSampleRate };
+    } catch {
+      // Fallback to FFmpeg below
+    } finally {
+      await ctx.close().catch(() => {});
+    }
   }
-  let arrayBuffer = await file.arrayBuffer();
-  const ctx = new AudioCtx();
-  let decoded;
+
   try {
-    decoded = await ctx.decodeAudioData(arrayBuffer);
-  } finally {
-    arrayBuffer = null;
-    await ctx.close().catch(() => {});
+    return await decodeAudioWithFFmpegFallback(file, 2, targetSampleRate, editProgress, 9, 5);
+  } catch (ffErr) {
+    throw new Error(
+      `音声データをデコードできませんでした（${file.name}）。ファイルが破損しているか、非対応形式の可能性があります。（詳細: ${formatError(ffErr)}）`
+    );
   }
-
-  const duration = decoded.duration;
-  if (decoded.sampleRate === targetSampleRate) {
-    const left = new Float32Array(decoded.getChannelData(0));
-    const right = decoded.numberOfChannels > 1
-      ? new Float32Array(decoded.getChannelData(1))
-      : new Float32Array(left);
-    decoded = null;
-    return { left, right, duration, sampleRate: targetSampleRate };
-  }
-
-  const targetLength = Math.max(1, Math.ceil(duration * targetSampleRate));
-  const offline = new OfflineAudioContext(2, targetLength, targetSampleRate);
-  const srcNode = offline.createBufferSource();
-  srcNode.buffer = decoded;
-  srcNode.connect(offline.destination);
-  srcNode.start(0);
-  const rendered = await offline.startRendering();
-  const left = new Float32Array(rendered.getChannelData(0));
-  const right = new Float32Array(rendered.getChannelData(1));
-  decoded = null;
-  return { left, right, duration, sampleRate: targetSampleRate };
 }
 
 function encodeStereoWav(left, right, sampleRate) {
