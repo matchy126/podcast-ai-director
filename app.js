@@ -1,4 +1,4 @@
-// Podcast AI Director v0.8.2
+// Podcast AI Director v0.8.4
 // WebGPU + VAD Fast Transcription, Low-Memory WebAudio Mixing, Multi-BGM, Intro/Outro Solo Boost, MP4 Telop
 
 const $ = (id) => document.getElementById(id);
@@ -553,37 +553,218 @@ async function decodeAudioTo16kMono(file) {
   return mono;
 }
 
+let uiProgressTimer = null;
+let gpuWatchdogTimer = null;
+
+function stopUiProgressTimer() {
+  if (uiProgressTimer) {
+    clearInterval(uiProgressTimer);
+    uiProgressTimer = null;
+  }
+}
+
+function stopGpuWatchdog() {
+  if (gpuWatchdogTimer) {
+    clearTimeout(gpuWatchdogTimer);
+    gpuWatchdogTimer = null;
+  }
+}
+
+function formatTimecodeShort(sec) {
+  const s = Math.max(0, Math.floor(sec));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
+}
+
+function formatEtaShort(sec) {
+  const s = Math.max(0, Math.round(sec));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return m > 0 ? `${m}分${r}秒` : `${r}秒`;
+}
+
 function getWorker() {
   if (!activeWorker) {
-    activeWorker = new Worker("./transcribe-worker.js?v=0.8.2", { type: "module" });
+    activeWorker = new Worker("./transcribe-worker.js?v=0.8.4", { type: "module" });
   }
   return activeWorker;
 }
 
 function resetWorker() {
+  stopUiProgressTimer();
+  stopGpuWatchdog();
   if (activeWorker) {
     activeWorker.terminate();
     activeWorker = null;
   }
 }
 
-async function transcribe() {
-  progress(2, "音声ファイルをデコード中…", "16kHz モノラル形式へ変換しています");
-  const mono16k = await decodeAudioTo16kMono(source);
-  progress(5, "AIワーカーへ音声データを転送中…", `${(mono16k.byteLength / 1048576).toFixed(1)} MB`);
-
+function runTranscribeWorker(mono16k, forceCpu = false) {
   const worker = getWorker();
+  const accelDevice = forceCpu ? "wasm" : ($("accelDevice")?.value || "auto");
+  const audioCopy = mono16k.slice();
+
+  let inferState = {
+    active: false,
+    device: accelDevice === "wasm" ? "wasm" : "webgpu",
+    inferStartPct: 25,
+    inferEndPct: 96,
+    totalBlocks: 1,
+    blockIndex: 0,
+    blockStartedAt: Date.now(),
+    avgBlockMs: 3000,
+    winStartSec: 0,
+    winEndSec: 15,
+    targetDuration: mono16k.length / 16000,
+    savedSec: 0,
+    lastPct: 5
+  };
+
+  const renderSmoothInferUi = () => {
+    if (!inferState.active) return;
+    const {
+      device,
+      inferStartPct,
+      inferEndPct,
+      totalBlocks,
+      blockIndex,
+      blockStartedAt,
+      avgBlockMs,
+      winStartSec,
+      winEndSec,
+      targetDuration,
+      savedSec
+    } = inferState;
+
+    const spanPct = inferEndPct - inferStartPct;
+    const elapsedInBlock = Math.max(0, Date.now() - blockStartedAt);
+    // ブロック予定時間を超えても止まらず滑らかに96%まで前進し続ける漸近カーブ
+    const expectedMs = Math.max(600, avgBlockMs);
+    const intraFraction = 0.96 * (elapsedInBlock / (elapsedInBlock + expectedMs * 0.65));
+
+    const effectiveBlock = Math.min(totalBlocks - 0.02, blockIndex + intraFraction);
+    const rawPct = inferStartPct + (effectiveBlock / Math.max(1, totalBlocks)) * spanPct;
+    const pct = Math.min(inferEndPct, Math.max(inferState.lastPct, rawPct));
+    inferState.lastPct = pct;
+
+    const modeBadge = device === "webgpu" ? "WebGPU高速" : "CPU標準";
+    const currentBlockNum = Math.min(totalBlocks, blockIndex + 1);
+    const analyzedSec = Math.min(
+      targetDuration,
+      winStartSec + (winEndSec - winStartSec) * Math.min(1, intraFraction)
+    );
+    const remainingBlocks = Math.max(0, totalBlocks - effectiveBlock);
+    const etaSec = (remainingBlocks * expectedMs) / 1000;
+    const vadBadge = savedSec >= 2 ? ` · 無音${Math.round(savedSec)}秒短縮` : "";
+    const etaText = etaSec >= 2 ? ` · 残り約 ${formatEtaShort(etaSec)}` : " · まもなく完了";
+
+    progress(
+      pct,
+      `文字起こし中（${modeBadge} · ブロック ${currentBlockNum}/${totalBlocks}）`,
+      `解析: ${formatTimecodeShort(analyzedSec)} / ${formatTimecodeShort(targetDuration)}${vadBadge}${etaText}`
+    );
+  };
+
   return new Promise((resolve, reject) => {
     const cleanup = () => {
+      stopUiProgressTimer();
+      stopGpuWatchdog();
       worker.onmessage = null;
       worker.onerror = null;
     };
 
+    const triggerCpuFallback = () => {
+      cleanup();
+      resetWorker();
+      progress(
+        Math.max(8, inferState.lastPct),
+        "WebGPUが応答しないためCPU標準モードへ自動切替中…",
+        "ワーカーを再起動して処理を継続します"
+      );
+      runTranscribeWorker(mono16k, true).then(resolve, reject);
+    };
+
+    const armGpuWatchdog = (ms) => {
+      stopGpuWatchdog();
+      if (forceCpu || accelDevice === "wasm") return;
+      gpuWatchdogTimer = setTimeout(() => {
+        triggerCpuFallback();
+      }, ms);
+    };
+
+    // 初回モデル取得・WebGPUコンパイル監視（35秒応答なしならCPUへ切替）
+    armGpuWatchdog(35000);
+
     worker.onmessage = (event) => {
       const msg = event.data || {};
-      if (msg.type === "status" || msg.type === "model-progress" || msg.type === "infer-progress") {
+      if (msg.type === "webgpu-stalled") {
+        triggerCpuFallback();
+        return;
+      }
+
+      if (msg.type === "status" || msg.type === "model-progress") {
+        inferState.active = false;
+        stopUiProgressTimer();
         const pct = Number.isFinite(msg.percent) ? msg.percent : Number($("progress").value || 10);
+        inferState.lastPct = Math.max(inferState.lastPct, pct);
         progress(pct, msg.text || "処理中…", msg.detail || "");
+        if (msg.device === "webgpu") {
+          armGpuWatchdog(msg.phase === "compiling" ? 25000 : 35000);
+        } else if (msg.device === "wasm") {
+          stopGpuWatchdog();
+        }
+      } else if (msg.type === "infer-init") {
+        inferState = {
+          ...inferState,
+          active: true,
+          device: msg.device || inferState.device,
+          inferStartPct: msg.inferStartPct ?? 25,
+          inferEndPct: msg.inferEndPct ?? 96,
+          totalBlocks: Math.max(1, msg.totalBlocks || 1),
+          blockIndex: 0,
+          blockStartedAt: Date.now(),
+          avgBlockMs: msg.avgBlockMs || 3000,
+          winStartSec: 0,
+          winEndSec: Math.min(15, msg.targetDuration || 15),
+          targetDuration: msg.targetDuration || inferState.targetDuration,
+          savedSec: msg.savedSec || 0,
+          lastPct: Math.max(inferState.lastPct, msg.inferStartPct ?? 25)
+        };
+        if (inferState.device === "webgpu") {
+          armGpuWatchdog(20000);
+        } else {
+          stopGpuWatchdog();
+        }
+        renderSmoothInferUi();
+        stopUiProgressTimer();
+        uiProgressTimer = setInterval(renderSmoothInferUi, 200);
+      } else if (msg.type === "block-start") {
+        inferState.active = true;
+        inferState.device = msg.device || inferState.device;
+        inferState.blockIndex = msg.blockIndex ?? inferState.blockIndex;
+        inferState.totalBlocks = Math.max(1, msg.totalBlocks || inferState.totalBlocks);
+        inferState.blockStartedAt = Date.now();
+        inferState.winStartSec = msg.winStartSec ?? inferState.winStartSec;
+        inferState.winEndSec = msg.winEndSec ?? inferState.winEndSec;
+        inferState.avgBlockMs = msg.avgBlockMs || inferState.avgBlockMs;
+        if (inferState.device === "webgpu") {
+          armGpuWatchdog(msg.blockIndex === 0 ? 20000 : 14000);
+        } else {
+          stopGpuWatchdog();
+        }
+        renderSmoothInferUi();
+      } else if (msg.type === "block-done") {
+        inferState.blockIndex = (msg.blockIndex ?? inferState.blockIndex) + 1;
+        inferState.blockStartedAt = Date.now();
+        inferState.avgBlockMs = msg.avgBlockMs || inferState.avgBlockMs;
+        const spanPct = inferState.inferEndPct - inferState.inferStartPct;
+        const exactPct = inferState.inferStartPct + (inferState.blockIndex / inferState.totalBlocks) * spanPct;
+        inferState.lastPct = Math.min(inferState.inferEndPct, Math.max(inferState.lastPct, exactPct));
+        if (inferState.device === "webgpu") {
+          armGpuWatchdog(14000);
+        }
+        renderSmoothInferUi();
       } else if (msg.type === "result") {
         cleanup();
         const engineTag = msg.deviceUsed === "webgpu" ? "WebGPU高速処理" : "CPU標準処理";
@@ -607,15 +788,26 @@ async function transcribe() {
     worker.postMessage(
       {
         type: "transcribe",
-        audio: mono16k.buffer,
+        audio: audioCopy.buffer,
         model: $("model").value,
         language: $("language").value,
-        accelDevice: $("accelDevice")?.value || "auto",
+        accelDevice,
         skipSilence: $("skipSilenceVad")?.checked !== false
       },
-      [mono16k.buffer]
+      [audioCopy.buffer]
     );
   });
+}
+
+async function transcribe() {
+  progress(2, "音声ファイルをデコード中…", "16kHz モノラル形式へ変換しています");
+  let mono16k = await decodeAudioTo16kMono(source);
+  try {
+    progress(5, "AIワーカーへ音声データを転送中…", `${(mono16k.byteLength / 1048576).toFixed(1)} MB`);
+    return await runTranscribeWorker(mono16k, false);
+  } finally {
+    mono16k = null;
+  }
 }
 
 $("cancelTranscribe").onclick = () => {

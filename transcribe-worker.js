@@ -7,8 +7,8 @@ const MODEL_IDS = {
 };
 
 const INITIAL_CHUNK_MS = {
-  wasm: { tiny: 3000, base: 5200, small: 11000 },
-  webgpu: { tiny: 450, base: 750, small: 1500 }
+  wasm: { tiny: 1800, base: 3200, small: 6500 },
+  webgpu: { tiny: 450, base: 800, small: 1500 }
 };
 
 let loadedKey = null; // `${modelKey}:${device}`
@@ -20,20 +20,6 @@ function formatMB(bytes) {
   return (bytes / 1048576).toFixed(1) + " MB";
 }
 
-function formatSecShort(sec) {
-  const s = Math.max(0, Math.round(sec));
-  const m = Math.floor(s / 60);
-  const r = s % 60;
-  return m > 0 ? `${m}分${r}秒` : `${r}秒`;
-}
-
-function formatTimecode(sec) {
-  const s = Math.max(0, Math.floor(sec));
-  const m = Math.floor(s / 60);
-  const r = s % 60;
-  return `${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
-}
-
 async function canUseWebGPU() {
   try {
     if (typeof navigator === "undefined" || !navigator.gpu) return false;
@@ -42,6 +28,16 @@ async function canUseWebGPU() {
   } catch {
     return false;
   }
+}
+
+function withTimeout(promise, ms, timeoutMessage) {
+  let timer = null;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(timeoutMessage)), ms);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
 }
 
 /**
@@ -124,7 +120,6 @@ function extractSpeechRegions(audio, sampleRate = 16000) {
   }
 
   const packedSec = packedSamples / sampleRate;
-  // 15%以上短縮できる場合のみ無音スキップを適用
   if (packedSec >= totalSec * 0.85 || packedSec < 1.5) {
     return null;
   }
@@ -147,6 +142,63 @@ function mapPackedTimeToOriginal(packedT, ranges) {
     if (packedT <= r.packedEnd) return r.origStart + (packedT - r.packedStart);
   }
   return ranges[ranges.length - 1].origEnd;
+}
+
+/**
+ * 音声配列を約15秒単位のウィンドウに分割（無音付近で区切り、頻繁な進捗更新とWebGPUハング防止を両立）
+ */
+function splitAudioIntoWindows(audio, sampleRate = 16000) {
+  const totalSamples = audio.length;
+  const maxWinSamples = Math.floor(15.0 * sampleRate);
+  const minWinSamples = Math.floor(10.0 * sampleRate);
+  const stepScan = Math.floor(0.1 * sampleRate); // 100ms単位で無音探索
+
+  if (totalSamples <= maxWinSamples) {
+    return [{ startSample: 0, endSample: totalSamples, startSec: 0, endSec: totalSamples / sampleRate }];
+  }
+
+  const windows = [];
+  let cursor = 0;
+
+  while (cursor < totalSamples) {
+    if (totalSamples - cursor <= maxWinSamples) {
+      windows.push({
+        startSample: cursor,
+        endSample: totalSamples,
+        startSec: cursor / sampleRate,
+        endSec: totalSamples / sampleRate
+      });
+      break;
+    }
+
+    const searchStart = cursor + minWinSamples;
+    const searchEnd = Math.min(totalSamples, cursor + maxWinSamples);
+    let bestSplit = searchEnd;
+    let lowestRms = Infinity;
+
+    for (let pos = searchStart; pos + stepScan <= searchEnd; pos += stepScan) {
+      let sumSq = 0;
+      for (let j = 0; j < stepScan; j += 4) {
+        const v = audio[pos + j];
+        sumSq += v * v;
+      }
+      const rms = sumSq / (stepScan / 4);
+      if (rms < lowestRms) {
+        lowestRms = rms;
+        bestSplit = pos + Math.floor(stepScan / 2);
+      }
+    }
+
+    windows.push({
+      startSample: cursor,
+      endSample: bestSplit,
+      startSec: cursor / sampleRate,
+      endSec: bestSplit / sampleRate
+    });
+    cursor = bestSplit;
+  }
+
+  return windows;
 }
 
 function collapseRepetitions(segments) {
@@ -192,6 +244,7 @@ async function createPipelineWithProgress(modelId, device) {
   self.postMessage({
     type: "status",
     phase: "model-init",
+    device,
     percent: 6,
     text: `AIモデルを準備中（${deviceLabel}）…`,
     detail: `${modelId} · 初回はモデル取得と初期化を行います`
@@ -238,6 +291,7 @@ async function createPipelineWithProgress(modelId, device) {
           self.postMessage({
             type: "model-progress",
             phase: "downloading",
+            device,
             percent,
             text: `AIモデルを取得中（${deviceLabel}）…`,
             detail: `${fileName}${sizeInfo}`
@@ -255,25 +309,28 @@ async function createPipelineWithProgress(modelId, device) {
             self.postMessage({
               type: "status",
               phase: "compiling",
+              device,
               percent: 20.5,
               text: `${deviceLabel}を初期化中…`,
-              detail: "初回のみ数秒〜数十秒かかります"
+              detail: "初回のみ数秒かかります"
             });
             compileTimer = setInterval(() => {
               const sec = (Date.now() - compileStart) / 1000;
-              const pct = Math.min(24.8, 20.5 + 4.3 * (1 - Math.exp(-sec / 10)));
+              const pct = Math.min(24.8, 20.5 + 4.3 * (1 - Math.exp(-sec / 8)));
               self.postMessage({
                 type: "status",
                 phase: "compiling",
+                device,
                 percent: pct,
                 text: `${deviceLabel}を初期化中…`,
                 detail: `モデル展開中（${Math.floor(sec)}秒経過）`
               });
-            }, 400);
+            }, 350);
           } else if (!compileTimer) {
             self.postMessage({
               type: "status",
               phase: "downloading",
+              device,
               percent: 19,
               text: "モデルファイルを展開中…",
               detail: `${fileName} 読み込み完了`
@@ -284,6 +341,7 @@ async function createPipelineWithProgress(modelId, device) {
           self.postMessage({
             type: "status",
             phase: "ready",
+            device,
             percent: 25,
             text: `AIモデル準備完了（${deviceLabel}）`,
             detail: "音声の文字起こし解析へ移行します"
@@ -320,18 +378,24 @@ async function getASR(modelKey, preferAutoGpu = true) {
   loadPromise = (async () => {
     env.allowLocalModels = false;
     if (env.backends?.onnx?.wasm) {
-      env.backends.onnx.wasm.numThreads = 1;
+      const canMultiThread = Boolean(self.crossOriginIsolated);
+      env.backends.onnx.wasm.numThreads = canMultiThread
+        ? Math.min(4, Math.max(1, navigator.hardwareConcurrency || 2))
+        : 1;
       env.backends.onnx.wasm.proxy = false;
     }
 
     if (targetDevice === "webgpu") {
       try {
-        const gpuAsr = await createPipelineWithProgress(modelId, "webgpu");
+        const gpuAsr = await withTimeout(
+          createPipelineWithProgress(modelId, "webgpu"),
+          35000,
+          "WebGPUモデルの初期化がタイムアウトしました"
+        );
         activeDeviceUsed = "webgpu";
         asrPipeline = gpuAsr;
         return gpuAsr;
       } catch {
-        // WebGPU初期化失敗時は自動でWASMにフォールバック
         loadedKey = `${key}:wasm`;
       }
     }
@@ -357,24 +421,16 @@ self.onmessage = async (event) => {
   const data = event.data || {};
   if (data.type !== "transcribe") return;
 
-  let smoothTimer = null;
-  const stopSmoothTimer = () => {
-    if (smoothTimer) {
-      clearInterval(smoothTimer);
-      smoothTimer = null;
-    }
-  };
-
   try {
     const modelKey = MODEL_IDS[data.model] ? data.model : "base";
     const preferAutoGpu = data.accelDevice !== "wasm";
-    let { asr, wasCachedInMemory, device } = await getASR(modelKey, preferAutoGpu);
+    const { asr, wasCachedInMemory, device } = await getASR(modelKey, preferAutoGpu);
 
     const rawAudio = new Float32Array(data.audio);
     const sampleRate = 16000;
     const origDurationSeconds = rawAudio.length / sampleRate;
 
-    // 無音スキップ（VAD）の適用
+    // 1. 無音スキップ（VAD）の適用
     let targetAudio = rawAudio;
     let vadResult = null;
     if (data.skipSilence !== false) {
@@ -385,139 +441,136 @@ self.onmessage = async (event) => {
     }
 
     const targetDuration = targetAudio.length / sampleRate;
-    const chunkLengthS = 30;
-    const strideLengthS = 2.5; // ストライド最適化でブロック数を削減
-    const effectiveStepS = chunkLengthS - strideLengthS * 2;
-    const estimatedChunks = Math.max(1, Math.ceil(targetDuration / effectiveStepS));
+    const savedSec = vadResult ? vadResult.savedSec : 0;
+
+    // 2. 約15秒ごとのウィンドウに分割（頻繁な進捗更新＆ハング防止）
+    const windows = splitAudioIntoWindows(targetAudio, sampleRate);
+    const totalBlocks = windows.length;
 
     const inferStartPct = wasCachedInMemory ? 8 : 25;
     const inferEndPct = 96;
-    const inferSpanPct = inferEndPct - inferStartPct;
+    let avgBlockMs = INITIAL_CHUNK_MS[device]?.[modelKey] || 3000;
 
-    let processedChunks = 0;
-    const inferStartedAt = Date.now();
-    let lastChunkAt = inferStartedAt;
-    let avgChunkMs = INITIAL_CHUNK_MS[device]?.[modelKey] || 5000;
-    let lastReportedPct = inferStartPct;
+    self.postMessage({
+      type: "infer-init",
+      device,
+      totalBlocks,
+      targetDuration,
+      savedSec,
+      inferStartPct,
+      inferEndPct,
+      avgBlockMs
+    });
 
-    const modeBadge = device === "webgpu" ? "WebGPU高速" : "CPU標準";
-    const vadBadge = vadResult ? ` · 無音${Math.round(vadResult.savedSec)}秒短縮` : "";
+    const collectedRawSegments = [];
 
-    const emitInferProgress = () => {
-      const now = Date.now();
-      const sinceLastMs = Math.max(0, now - lastChunkAt);
-      const intraFraction = processedChunks >= estimatedChunks
-        ? 0.95
-        : 0.92 * (1 - Math.exp(-2.2 * (sinceLastMs / Math.max(400, avgChunkMs))));
+    for (let idx = 0; idx < totalBlocks; idx++) {
+      const win = windows[idx];
+      const slice = targetAudio.subarray(win.startSample, win.endSample);
+      const sliceDuration = slice.length / sampleRate;
+      const blockStartedAt = Date.now();
 
-      const effectiveCompleted = Math.min(estimatedChunks - 0.05, processedChunks + intraFraction);
-      const rawPct = inferStartPct + (effectiveCompleted / estimatedChunks) * inferSpanPct;
-      const pct = Math.min(inferEndPct, Math.max(lastReportedPct, rawPct));
-      lastReportedPct = pct;
-
-      const currentBlock = Math.min(estimatedChunks, processedChunks + 1);
-      const analyzedSec = Math.min(targetDuration, effectiveCompleted * effectiveStepS);
-      const remainingChunks = Math.max(0, estimatedChunks - effectiveCompleted);
-      const etaSec = (remainingChunks * avgChunkMs) / 1000;
-
-      const etaText = etaSec >= 2 ? ` · 残り約 ${formatSecShort(etaSec)}` : " · まもなく完了";
       self.postMessage({
-        type: "infer-progress",
-        phase: "inferring",
-        percent: pct,
-        text: `文字起こし中（${modeBadge} · ブロック ${currentBlock}/${estimatedChunks}）`,
-        detail: `解析: ${formatTimecode(analyzedSec)} / ${formatTimecode(targetDuration)}${vadBadge}${etaText}`
+        type: "block-start",
+        device,
+        blockIndex: idx,
+        totalBlocks,
+        winStartSec: win.startSec,
+        winEndSec: win.endSec,
+        targetDuration,
+        savedSec,
+        avgBlockMs
       });
-    };
 
-    emitInferProgress();
-    smoothTimer = setInterval(emitInferProgress, 300);
-
-    const runInference = async (pipelineInstance) => {
-      return pipelineInstance(targetAudio, {
+      const runBlock = () => asr(slice, {
         language: data.language || "japanese",
         task: "transcribe",
-        chunk_length_s: chunkLengthS,
-        stride_length_s: strideLengthS,
         return_timestamps: true,
         repetition_penalty: 1.1,
-        no_repeat_ngram_size: 3,
-        chunk_callback: () => {
-          const now = Date.now();
-          processedChunks += 1;
-          lastChunkAt = now;
-          const measuredAvg = (now - inferStartedAt) / processedChunks;
-          avgChunkMs = measuredAvg * 0.8 + avgChunkMs * 0.2;
-          emitInferProgress();
-        }
+        no_repeat_ngram_size: 3
       });
-    };
 
-    let result;
-    try {
-      result = await runInference(asr);
-    } catch (gpuRunErr) {
-      // WebGPU推論途中でエラーが起きた場合は自動でCPU(WASM)に切り替えて再試行
+      let blockResult;
       if (device === "webgpu") {
-        stopSmoothTimer();
-        processedChunks = 0;
-        lastReportedPct = 10;
-        const fallback = await getASR(modelKey, false);
-        asr = fallback.asr;
-        device = "wasm";
-        avgChunkMs = INITIAL_CHUNK_MS.wasm[modelKey] || 5200;
-        emitInferProgress();
-        smoothTimer = setInterval(emitInferProgress, 350);
-        result = await runInference(asr);
+        // WebGPUが18秒（2ブロック目以降は12秒）応答しない場合はメインスレッド側でWorkerごと即再起動してCPU切替
+        const limitMs = idx === 0 ? 18000 : 12000;
+        try {
+          blockResult = await withTimeout(runBlock(), limitMs, "WEBGPU_HANG");
+        } catch (err) {
+          if (err?.message === "WEBGPU_HANG") {
+            self.postMessage({ type: "webgpu-stalled" });
+            return;
+          }
+          throw err;
+        }
       } else {
-        throw gpuRunErr;
+        blockResult = await runBlock();
+      }
+
+      const elapsedBlockMs = Math.max(150, Date.now() - blockStartedAt);
+      avgBlockMs = idx === 0 ? elapsedBlockMs : (elapsedBlockMs * 0.7 + avgBlockMs * 0.3);
+
+      self.postMessage({
+        type: "block-done",
+        device,
+        blockIndex: idx,
+        totalBlocks,
+        winEndSec: win.endSec,
+        targetDuration,
+        savedSec,
+        elapsedBlockMs,
+        avgBlockMs
+      });
+
+      const rawChunks = Array.isArray(blockResult?.chunks) && blockResult.chunks.length
+        ? blockResult.chunks
+        : [{ timestamp: [0, sliceDuration], text: blockResult?.text || "" }];
+
+      for (let cIdx = 0; cIdx < rawChunks.length; cIdx++) {
+        const c = rawChunks[cIdx];
+        const localStart = Math.max(0, Number(c.timestamp?.[0] ?? 0));
+        const tsEnd = c.timestamp?.[1];
+        let localEnd = Number.isFinite(tsEnd) ? Number(tsEnd) : sliceDuration;
+        if (localEnd <= localStart) {
+          const nextStart = rawChunks[cIdx + 1]?.timestamp?.[0];
+          localEnd = Number.isFinite(nextStart) && nextStart > localStart
+            ? Number(nextStart)
+            : Math.min(sliceDuration, localStart + 1.0);
+        }
+
+        const packedStart = win.startSec + localStart;
+        const packedEnd = win.startSec + Math.min(sliceDuration, localEnd);
+        const origStart = vadResult ? mapPackedTimeToOriginal(packedStart, vadResult.ranges) : packedStart;
+        const origEnd = vadResult ? mapPackedTimeToOriginal(packedEnd, vadResult.ranges) : packedEnd;
+        const text = (c.text || "").trim();
+
+        if (text) {
+          collectedRawSegments.push({
+            start: Math.min(origDurationSeconds, origStart),
+            end: Math.min(origDurationSeconds, Math.max(origStart + 0.1, origEnd)),
+            text
+          });
+        }
       }
     }
-
-    stopSmoothTimer();
 
     self.postMessage({
       type: "status",
       phase: "postprocess",
+      device,
       percent: 98,
       text: "タイムスタンプと文章を整形中…",
       detail: ""
     });
 
-    const rawChunks = Array.isArray(result?.chunks) && result.chunks.length
-      ? result.chunks
-      : [{ timestamp: [0, targetDuration], text: result?.text || "" }];
-
-    const rawSegments = rawChunks.map((c, idx) => {
-      const pStart = Math.max(0, Number(c.timestamp?.[0] ?? 0));
-      const tsEnd = c.timestamp?.[1];
-      let pEnd = Number.isFinite(tsEnd) ? Number(tsEnd) : targetDuration;
-      if (pEnd <= pStart) {
-        const nextStart = rawChunks[idx + 1]?.timestamp?.[0];
-        pEnd = Number.isFinite(nextStart) && nextStart > pStart
-          ? Number(nextStart)
-          : Math.min(targetDuration, pStart + 1.0);
-      }
-
-      const origStart = vadResult ? mapPackedTimeToOriginal(pStart, vadResult.ranges) : pStart;
-      const origEnd = vadResult ? mapPackedTimeToOriginal(pEnd, vadResult.ranges) : pEnd;
-
-      return {
-        start: Math.min(origDurationSeconds, origStart),
-        end: Math.min(origDurationSeconds, Math.max(origStart + 0.1, origEnd)),
-        text: (c.text || "").trim()
-      };
-    }).filter((s) => s.text);
-
-    const segments = collapseRepetitions(rawSegments);
+    const segments = collapseRepetitions(collectedRawSegments);
     self.postMessage({
       type: "result",
       segments,
       deviceUsed: device,
-      savedSec: vadResult ? vadResult.savedSec : 0
+      savedSec
     });
   } catch (error) {
-    stopSmoothTimer();
     self.postMessage({
       type: "error",
       message: error?.message || String(error)
